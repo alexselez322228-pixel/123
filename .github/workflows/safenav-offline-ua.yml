@@ -46,23 +46,25 @@ jobs:
 
           root = Path("om")
 
-          # 1) Strong offline/privacy manifest: no network capability, no Android backup.
-          manifest = root / "android/app/src/main/AndroidManifest.xml"
-          s = manifest.read_text(encoding="utf-8")
-          for perm in (
-              "android.permission.INTERNET",
-              "android.permission.ACCESS_NETWORK_STATE",
-          ):
-              s = re.sub(r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"\s*/>\s*', '\n', s)
-
-          # Manifest merger can re-add network permissions from library manifests.
-          # tools:node="remove" guarantees they are absent from the final APK.
-          manifest_open = s.find(">")
-          forced_removals = """\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n"""
-          s = s[:manifest_open + 1] + forced_removals + s[manifest_open + 1:]
-          s = s.replace('android:allowBackup="true"', 'android:allowBackup="false"')
-          s = s.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
-          manifest.write_text(s, encoding="utf-8")
+          # 1) Strong offline/privacy manifests: remove network capability from every module
+          # before Android Manifest Merger runs.
+          for mf in root.glob("android/**/AndroidManifest.xml"):
+              ms = mf.read_text(encoding="utf-8")
+              original = ms
+              for perm in (
+                  "android.permission.INTERNET",
+                  "android.permission.ACCESS_NETWORK_STATE",
+              ):
+                  ms = re.sub(
+                      r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"(?:\s+[^>]*)?/?>\s*',
+                      '\n',
+                      ms
+                  )
+              if mf == root / "android/app/src/main/AndroidManifest.xml":
+                  ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+                  ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
+              if ms != original:
+                  mf.write_text(ms, encoding="utf-8")
 
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
