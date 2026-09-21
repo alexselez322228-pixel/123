@@ -72,6 +72,14 @@ jobs:
               if ms != original:
                   mf.write_text(ms, encoding="utf-8")
 
+          # 1b) Organic Maps has its own APK permission whitelist. SafeNav is intentionally
+          # offline, so INTERNET and ACCESS_NETWORK_STATE must not be required by that check.
+          app_gradle = root / "android/app/build.gradle"
+          ag = app_gradle.read_text(encoding="utf-8")
+          ag = ag.replace('    "name=\'android.permission.INTERNET\'",\n', '')
+          ag = ag.replace('    "name=\'android.permission.ACCESS_NETWORK_STATE\'",\n', '')
+          app_gradle.write_text(ag, encoding="utf-8")
+
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
           s = gradle.read_text(encoding="utf-8")
