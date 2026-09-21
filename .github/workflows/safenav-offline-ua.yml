@@ -63,6 +63,14 @@ jobs:
               if mf == root / "android/app/src/main/AndroidManifest.xml":
                   ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
                   ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
+                  # Force Manifest Merger to reject network permissions supplied by external AARs.
+                  removal_nodes = (
+                      '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>'
+                      '\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n'
+                  )
+                  ms, n = re.subn(r'(<manifest\\b[^>]*>)', r'\\1' + removal_nodes, ms, count=1, flags=re.S)
+                  if n != 1:
+                      raise SystemExit("Could not locate opening <manifest> tag")
               if ms != original:
                   mf.write_text(ms, encoding="utf-8")
 
