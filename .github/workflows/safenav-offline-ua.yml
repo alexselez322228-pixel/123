@@ -54,6 +54,12 @@ jobs:
               "android.permission.ACCESS_NETWORK_STATE",
           ):
               s = re.sub(r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"\s*/>\s*', '\n', s)
+
+          # Manifest merger can re-add network permissions from library manifests.
+          # tools:node="remove" guarantees they are absent from the final APK.
+          manifest_open = s.find(">")
+          forced_removals = """\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n"""
+          s = s[:manifest_open + 1] + forced_removals + s[manifest_open + 1:]
           s = s.replace('android:allowBackup="true"', 'android:allowBackup="false"')
           s = s.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
           manifest.write_text(s, encoding="utf-8")
