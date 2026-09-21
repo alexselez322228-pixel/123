@@ -80,6 +80,8 @@ jobs:
           # 4) Register every Ukrainian .mwm directly from APK assets.
           cpp = root / "libs/platform/local_country_file_utils.cpp"
           s = cpp.read_text(encoding="utf-8")
+          if "#include <array>" not in s:
+              s = "#include <array>\n" + s
           anchor = "  // Check for World and WorldCoasts in app bundle or in resources.\n"
           idx = s.find(anchor)
           if idx < 0:
@@ -227,7 +229,7 @@ jobs:
         env:
           CI: "true"
         run: |
-          ./gradlew --no-daemon --stacktrace -Parm64 -Ppch -Pnjobs=2 -Pfirebase=false :app:assembleFdroidProfileable
+          ./gradlew --no-daemon --stacktrace -Parm64 -Pnjobs=2 -Pfirebase=false :app:assembleFdroidProfileable
 
       - name: Collect and verify APK
         run: |
