@@ -32,10 +32,8 @@ jobs:
 
       - name: Fetch Organic Maps source
         run: |
-          git clone --filter=blob:none --no-checkout https://github.com/organicmaps/organicmaps.git om
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/organicmaps/organicmaps.git om
           cd om
-          git fetch --depth=1 origin 3ef3791
-          git checkout --detach FETCH_HEAD
           git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
           echo "sdk.dir=$ANDROID_HOME" > android/local.properties
           echo "ndk.dir=$ANDROID_HOME/ndk/29.0.14206865" >> android/local.properties
