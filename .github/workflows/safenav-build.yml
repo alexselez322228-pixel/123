@@ -75,6 +75,10 @@ jobs:
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
           s = gradle.read_text(encoding="utf-8")
+          # Organic Maps' own APK permission verifier treats network permissions as mandatory.
+          # SafeNav intentionally removes them, so remove the same two entries from its whitelist.
+          s = s.replace('    "name=\\'android.permission.INTERNET\\'",\n', '')
+          s = s.replace('    "name=\\'android.permission.ACCESS_NETWORK_STATE\\'",\n', '')
           marker = "defaultConfig {"
           p = s.find(marker)
           if p < 0:
