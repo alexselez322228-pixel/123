@@ -5,6 +5,9 @@ on:
     branches: [safenav-apk-build]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -282,6 +285,19 @@ jobs:
           sha256sum SafeNav-Offline-UA-v0.2.apk | tee SafeNav-Offline-UA-v0.2.sha256
           ls -lh SafeNav-Offline-UA-v0.2.apk
           df -h
+
+      - name: Publish public APK download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete safenav-offline-ua-v0.2 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-ua-v0.2 \
+            SafeNav-Offline-UA-v0.2.apk \
+            SafeNav-Offline-UA-v0.2.sha256 \
+            permissions.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SafeNav Offline UA v0.2" \
+            --notes "Fully offline Ukraine navigation build. Ukraine MWM maps are bundled in the APK. INTERNET and ACCESS_NETWORK_STATE permissions are absent."
 
       - uses: actions/upload-artifact@v4
         with:
