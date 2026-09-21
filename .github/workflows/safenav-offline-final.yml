@@ -1,0 +1,284 @@
+name: Build SafeNav Offline Ukraine Final Main
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/safenav-offline-ua.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk/* /opt/ghc /usr/local/share/boost || true
+          docker system prune -af || true
+          df -h
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build ccache curl unzip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"             "platforms;android-36"             "build-tools;36.0.0"             "cmake;3.22.1"             "ndk;29.0.14206865"
+
+      - name: Fetch Organic Maps source
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/organicmaps/organicmaps.git om
+          cd om
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/29.0.14206865" >> android/local.properties
+
+      - name: Patch SafeNav privacy, branding and bundled map support
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("om")
+
+          # 1) Strong offline/privacy manifests: remove network capability from every module
+          # before Android Manifest Merger runs.
+          for mf in root.glob("android/**/AndroidManifest.xml"):
+              ms = mf.read_text(encoding="utf-8")
+              original = ms
+              for perm in (
+                  "android.permission.INTERNET",
+                  "android.permission.ACCESS_NETWORK_STATE",
+              ):
+                  ms = re.sub(
+                      r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"(?:\s+[^>]*)?/?>\s*',
+                      '\n',
+                      ms
+                  )
+              if mf == root / "android/app/src/main/AndroidManifest.xml":
+                  ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+                  ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
+                  # Force Manifest Merger to reject network permissions supplied by external AARs.
+                  removal_nodes = (
+                      '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>'
+                      '\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n'
+                  )
+                  ms, n = re.subn(r'(<manifest\b[^>]*>)', r'\\1' + removal_nodes, ms, count=1, flags=re.S)
+                  if n != 1:
+                      raise SystemExit("Could not locate opening <manifest> tag")
+              if ms != original:
+                  mf.write_text(ms, encoding="utf-8")
+
+          # 2) Give the sideload build its own application id.
+          gradle = root / "android/app/build.gradle"
+          s = gradle.read_text(encoding="utf-8")
+          marker = "defaultConfig {"
+          p = s.find(marker)
+          if p < 0:
+              raise SystemExit("defaultConfig not found")
+          insert_at = p + len(marker)
+          s = s[:insert_at] + "\n    applicationId 'app.safenav.offline'\n" + s[insert_at:]
+          gradle.write_text(s, encoding="utf-8")
+
+          # 3) Brand visible app name while keeping Organic Maps attribution/About pages.
+          for path in root.glob("android/app/src/main/res/values*/strings.xml"):
+              txt = path.read_text(encoding="utf-8")
+              txt2 = re.sub(r'(<string\s+name="app_name"[^>]*>).*?(</string>)',
+                            r'\1SafeNav Offline UA\2', txt, count=1, flags=re.S)
+              if txt2 != txt:
+                  path.write_text(txt2, encoding="utf-8")
+
+          # 4) Register every Ukrainian .mwm directly from APK assets.
+          cpp = root / "libs/platform/local_country_file_utils.cpp"
+          s = cpp.read_text(encoding="utf-8")
+          if "#include <array>" not in s:
+              s = "#include <array>\n" + s
+          anchor = "  // Check for World and WorldCoasts in app bundle or in resources.\n"
+          idx = s.find(anchor)
+          if idx < 0:
+              raise SystemExit("bundle anchor not found")
+
+          # Insert after existing World/WorldCoasts block. Locate the end via CleanupMapsDirectory.
+          end_anchor = "\nvoid CleanupMapsDirectory(int64_t latestVersion)"
+          end = s.find(end_anchor, idx)
+          if end < 0:
+              raise SystemExit("cleanup anchor not found")
+
+          block_end = s.rfind("\n}", idx, end)
+          if block_end < 0:
+              raise SystemExit("function closing brace not found")
+
+          names = [
+            "Ukraine_Cherkasy Oblast",
+            "Ukraine_Chernihiv Oblast",
+            "Ukraine_Chernivtsi Oblast",
+            "Ukraine_Dnipropetrovsk Oblast",
+            "Ukraine_Donetsk Oblast",
+            "Ukraine_Ivano-Frankivsk Oblast",
+            "Ukraine_Kharkiv Oblast",
+            "Ukraine_Kherson Oblast",
+            "Ukraine_Khmelnytskyi Oblast",
+            "Ukraine_Kirovohrad Oblast",
+            "Ukraine_Kyiv Oblast",
+            "Ukraine_Luhansk Oblast",
+            "Ukraine_Lviv Oblast",
+            "Ukraine_Mykolaiv Oblast",
+            "Ukraine_Odessa Oblast",
+            "Ukraine_Poltava Oblast",
+            "Ukraine_Rivne Oblast",
+            "Ukraine_Sumy Oblast",
+            "Ukraine_Ternopil Oblast",
+            "Ukraine_Vinnytsia Oblast",
+            "Ukraine_Volyn Oblast",
+            "Ukraine_Zakarpattia Oblast",
+            "Ukraine_Zaporizhia Oblast",
+            "Ukraine_Zhytomyr Oblast",
+            "Crimea",
+          ]
+          quoted = ",\n      ".join('"' + n + '"' for n in names)
+          patch = f'''
+            // SafeNav: detailed Ukraine maps are intentionally bundled inside the APK.
+            // Empty LocalCountryFile directory marks a resource/APK-backed map.
+            std::array<char const *, {len(names)}> const kSafeNavBundledMaps = {{
+                {quoted}
+            }};
+            for (char const * bundledName : kSafeNavBundledMaps)
+            {{
+              try
+              {{
+                std::string const fileName(bundledName);
+                ModelReaderPtr reader(platform.GetReader(fileName + DATA_FILE_EXTENSION, "r"));
+                LocalCountryFile bundledFile(std::string(), CountryFile(fileName), version::ReadVersionDate(reader));
+                bundledFile.m_files[base::Underlying(MapFileType::Map)] = reader.Size();
+
+                auto existing = std::find_if(localFiles.begin(), localFiles.end(),
+                                             [&fileName](LocalCountryFile const & f)
+                                             {{ return f.GetCountryName() == fileName; }});
+                if (existing == localFiles.end())
+                  localFiles.push_back(std::move(bundledFile));
+                else if (bundledFile.GetVersion() > existing->GetVersion())
+                  *existing = std::move(bundledFile);
+              }}
+              catch (RootException const & ex)
+              {{
+                LOG(LWARNING, ("SafeNav bundled map missing:", bundledName, ex.Msg()));
+              }}
+            }}
+          '''
+          s = s[:block_end] + patch + s[block_end:]
+          cpp.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Bundle all Ukraine maps
+        run: |
+          cd om
+          mkdir -p android/app/src/fdroid/assets
+          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
+          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
+
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.parse
+          from pathlib import Path
+
+          data = json.load(open("data/countries.json", encoding="utf-8"))
+          def find(node):
+              if isinstance(node, dict):
+                  if node.get("id") == "Ukraine":
+                      return node
+                  for v in node.values():
+                      r = find(v)
+                      if r: return r
+              elif isinstance(node, list):
+                  for v in node:
+                      r = find(v)
+                      if r: return r
+              return None
+
+          ua = find(data)
+          if not ua:
+              raise SystemExit("Ukraine node not found")
+
+          version = str(data["v"])
+          dest = Path("android/app/src/fdroid/assets")
+          mirrors = [
+              "https://cdn.organicmaps.app/",
+              "https://cdn-nl1.organicmaps.app/",
+              "https://cdn-uk1.organicmaps.app/",
+          ]
+
+          total = 0
+          for entry in ua["g"]:
+              filename = entry["id"] + ".mwm"
+              expected = int(entry["s"])
+              out = dest / filename
+              encoded = urllib.parse.quote(filename, safe="_.-")
+              ok = False
+              for mirror in mirrors:
+                  url = f"{mirror}maps/{version}/{encoded}"
+                  print("Downloading", url, flush=True)
+                  rc = subprocess.run([
+                      "curl", "-fL", "--retry", "3", "--retry-delay", "2",
+                      "--connect-timeout", "20", "-o", str(out), url
+                  ]).returncode
+                  if rc == 0 and out.exists() and out.stat().st_size == expected:
+                      ok = True
+                      break
+                  if out.exists():
+                      out.unlink()
+              if not ok:
+                  raise SystemExit(f"Failed or wrong size: {filename} expected={expected}")
+              total += expected
+
+          print(f"Bundled {len(ua['g'])} Ukraine maps, {total} bytes")
+          PY
+
+          du -sh android/app/src/fdroid/assets
+          ls -lh android/app/src/fdroid/assets | head -40
+
+      - name: Build arm64 APK
+        working-directory: om/android
+        env:
+          CI: "true"
+        run: |
+          ./gradlew --no-daemon --stacktrace -Parm64 -Pnjobs=2 -Pfirebase=false :app:assembleFdroidProfileable
+
+      - name: Collect and verify APK
+        run: |
+          APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
+          test -n "$APK"
+          cp "$APK" SafeNav-Offline-UA-v0.2.apk
+
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          "$AAPT" dump permissions SafeNav-Offline-UA-v0.2.apk | tee permissions.txt
+
+          if grep -q "android.permission.INTERNET" permissions.txt; then
+            echo "ERROR: INTERNET permission found"
+            exit 1
+          fi
+          if grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE permission found"
+            exit 1
+          fi
+
+          COUNT="$(unzip -l SafeNav-Offline-UA-v0.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          echo "Bundled MWM count: $COUNT"
+          test "$COUNT" -ge 27
+
+          sha256sum SafeNav-Offline-UA-v0.2.apk | tee SafeNav-Offline-UA-v0.2.sha256
+          ls -lh SafeNav-Offline-UA-v0.2.apk
+          df -h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SafeNav-Offline-UA-v0.2
+          path: |
+            SafeNav-Offline-UA-v0.2.apk
+            SafeNav-Offline-UA-v0.2.sha256
+            permissions.txt
+          compression-level: 0
+          if-no-files-found: error
