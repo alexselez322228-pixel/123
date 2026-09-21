@@ -1,0 +1,56 @@
+name: Build SafeNav APK
+on:
+  push:
+    branches: [safenav-apk-build]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: safenav-apk-build
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore source
+        run: |
+          mkdir -p /tmp/safenav
+          base64 -d safenav-build/source.b64 > /tmp/safenav/source.zip
+          cd /tmp/safenav
+          unzip -q source.zip -d project
+      - name: Prepare Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+      - name: Install Gradle
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.13-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+      - name: Build debug APK
+        run: |
+          cd /tmp/safenav/project
+          /tmp/gradle-8.13/bin/gradle --no-daemon clean :app:assembleDebug
+      - name: Verify privacy permissions
+        run: |
+          APK=/tmp/safenav/project/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions "$APK" | tee /tmp/permissions.txt
+          if grep -q "android.permission.INTERNET" /tmp/permissions.txt; then
+            echo "ERROR: INTERNET permission found"
+            exit 1
+          fi
+          if grep -q "android.permission.ACCESS_NETWORK_STATE" /tmp/permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE found"
+            exit 1
+          fi
+          cp "$APK" /tmp/SafeNavOffline-v0.1.0.apk
+          sha256sum /tmp/SafeNavOffline-v0.1.0.apk | tee /tmp/SafeNavOffline-v0.1.0.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SafeNavOffline-v0.1.0
+          path: |
+            /tmp/SafeNavOffline-v0.1.0.apk
+            /tmp/SafeNavOffline-v0.1.0.sha256
+            /tmp/permissions.txt
+          if-no-files-found: error
