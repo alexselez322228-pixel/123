@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv
+name: Build SafeNav Offline Kyiv v0.2.2
 
 on:
   push:
@@ -102,89 +102,17 @@ jobs:
           for path in root.glob("android/app/src/main/res/values*/strings.xml"):
               txt = path.read_text(encoding="utf-8")
               txt2 = re.sub(r'(<string\s+name="app_name"[^>]*>).*?(</string>)',
-                            r'\1SafeNav Offline UA\2', txt, count=1, flags=re.S)
+                            r'\1SafeNav Offline Kyiv\2', txt, count=1, flags=re.S)
               if txt2 != txt:
                   path.write_text(txt2, encoding="utf-8")
 
-          # 4) Register every Ukrainian .mwm directly from APK assets.
+          # 4) Keep Organic Maps' normal LocalCountryFile lifecycle.
+          # Bundled maps are packaged as assets and installed into the writable maps
+          # directory by the app's existing resource/copy path rather than being exposed
+          # as zero-directory APK-backed LocalCountryFile objects. The previous direct
+          # registration was the source of the startup crash on Xiaomi.
           cpp = root / "libs/platform/local_country_file_utils.cpp"
-          s = cpp.read_text(encoding="utf-8")
-          if "#include <array>" not in s:
-              s = "#include <array>\n" + s
-          anchor = "  // Check for World and WorldCoasts in app bundle or in resources.\n"
-          idx = s.find(anchor)
-          if idx < 0:
-              raise SystemExit("bundle anchor not found")
-
-          # Insert after existing World/WorldCoasts block. Locate the end via CleanupMapsDirectory.
-          end_anchor = "\nvoid CleanupMapsDirectory(int64_t latestVersion)"
-          end = s.find(end_anchor, idx)
-          if end < 0:
-              raise SystemExit("cleanup anchor not found")
-
-          block_end = s.rfind("\n}", idx, end)
-          if block_end < 0:
-              raise SystemExit("function closing brace not found")
-
-          names = [
-            "Ukraine_Cherkasy Oblast",
-            "Ukraine_Chernihiv Oblast",
-            "Ukraine_Chernivtsi Oblast",
-            "Ukraine_Dnipropetrovsk Oblast",
-            "Ukraine_Donetsk Oblast",
-            "Ukraine_Ivano-Frankivsk Oblast",
-            "Ukraine_Kharkiv Oblast",
-            "Ukraine_Kherson Oblast",
-            "Ukraine_Khmelnytskyi Oblast",
-            "Ukraine_Kirovohrad Oblast",
-            "Ukraine_Kyiv Oblast",
-            "Ukraine_Luhansk Oblast",
-            "Ukraine_Lviv Oblast",
-            "Ukraine_Mykolaiv Oblast",
-            "Ukraine_Odessa Oblast",
-            "Ukraine_Poltava Oblast",
-            "Ukraine_Rivne Oblast",
-            "Ukraine_Sumy Oblast",
-            "Ukraine_Ternopil Oblast",
-            "Ukraine_Vinnytsia Oblast",
-            "Ukraine_Volyn Oblast",
-            "Ukraine_Zakarpattia Oblast",
-            "Ukraine_Zaporizhia Oblast",
-            "Ukraine_Zhytomyr Oblast",
-            "Crimea",
-          ]
-          quoted = ",\n      ".join('"' + n + '"' for n in names)
-          patch = f'''
-            // SafeNav: detailed Ukraine maps are intentionally bundled inside the APK.
-            // Empty LocalCountryFile directory marks a resource/APK-backed map.
-            std::array<char const *, {len(names)}> const kSafeNavBundledMaps = {{
-                {quoted}
-            }};
-            for (char const * bundledName : kSafeNavBundledMaps)
-            {{
-              try
-              {{
-                std::string const fileName(bundledName);
-                ModelReaderPtr reader(platform.GetReader(fileName + DATA_FILE_EXTENSION, "r"));
-                LocalCountryFile bundledFile(std::string(), CountryFile(fileName), version::ReadVersionDate(reader));
-                bundledFile.m_files[base::Underlying(MapFileType::Map)] = reader.Size();
-
-                auto existing = std::find_if(localFiles.begin(), localFiles.end(),
-                                             [&fileName](LocalCountryFile const & f)
-                                             {{ return f.GetCountryName() == fileName; }});
-                if (existing == localFiles.end())
-                  localFiles.push_back(std::move(bundledFile));
-                else if (bundledFile.GetVersion() > existing->GetVersion())
-                  *existing = std::move(bundledFile);
-              }}
-              catch (RootException const & ex)
-              {{
-                LOG(LWARNING, ("SafeNav bundled map missing:", bundledName, ex.Msg()));
-              }}
-            }}
-          '''
-          s = s[:block_end] + patch + s[block_end:]
-          cpp.write_text(s, encoding="utf-8")
+          # No native LocalCountryFile injection in this build.
           PY
 
       - name: Bundle all Ukraine maps
@@ -267,10 +195,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-Kyiv-v0.2.1.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.2.2.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.2.1.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.2.2.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -281,33 +209,33 @@ jobs:
             exit 1
           fi
 
-          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.2.1.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.2.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
           echo "Bundled MWM count: $COUNT"
           test "$COUNT" -ge 3
 
-          sha256sum SafeNav-Offline-Kyiv-v0.2.1.apk | tee SafeNav-Offline-Kyiv-v0.2.1.sha256
-          ls -lh SafeNav-Offline-Kyiv-v0.2.1.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.2.2.apk | tee SafeNav-Offline-Kyiv-v0.2.2.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.2.2.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-kyiv-v0.2.1 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-kyiv-v0.2.1 \
-            SafeNav-Offline-Kyiv-v0.2.1.apk \
-            SafeNav-Offline-Kyiv-v0.2.1.sha256 \
+          gh release delete safenav-offline-kyiv-v0.2.2 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.2.2 \
+            SafeNav-Offline-Kyiv-v0.2.2.apk \
+            SafeNav-Offline-Kyiv-v0.2.2.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline Kyiv v0.2.1" \
+            --title "SafeNav Offline Kyiv v0.2.2" \
             --notes "Fully offline Ukraine navigation build. Ukraine MWM maps are bundled in the APK. INTERNET and ACCESS_NETWORK_STATE permissions are absent."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-Kyiv-v0.2.1
+          name: SafeNav-Offline-Kyiv-v0.2.2
           path: |
-            SafeNav-Offline-Kyiv-v0.2.1.apk
-            SafeNav-Offline-Kyiv-v0.2.1.sha256
+            SafeNav-Offline-Kyiv-v0.2.2.apk
+            SafeNav-Offline-Kyiv-v0.2.2.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
