@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Ukraine Final
+name: Build SafeNav Offline Kyiv
 
 on:
   push:
@@ -225,7 +225,10 @@ jobs:
           ]
 
           total = 0
-          for entry in ua["g"]:
+          selected = [entry for entry in ua["g"] if entry["id"] == "Ukraine_Kyiv Oblast"]
+          if len(selected) != 1:
+              raise SystemExit("Kyiv Oblast map not found")
+          for entry in selected:
               filename = entry["id"] + ".mwm"
               expected = int(entry["s"])
               out = dest / filename
@@ -247,7 +250,7 @@ jobs:
                   raise SystemExit(f"Failed or wrong size: {filename} expected={expected}")
               total += expected
 
-          print(f"Bundled {len(ua['g'])} Ukraine maps, {total} bytes")
+          print(f"Bundled Kyiv Oblast map, {total} bytes")
           PY
 
           du -sh android/app/src/fdroid/assets
@@ -264,10 +267,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-UA-v0.2.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.2.1.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-UA-v0.2.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.2.1.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -278,33 +281,33 @@ jobs:
             exit 1
           fi
 
-          COUNT="$(unzip -l SafeNav-Offline-UA-v0.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.2.1.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
           echo "Bundled MWM count: $COUNT"
-          test "$COUNT" -ge 27
+          test "$COUNT" -ge 3
 
-          sha256sum SafeNav-Offline-UA-v0.2.apk | tee SafeNav-Offline-UA-v0.2.sha256
-          ls -lh SafeNav-Offline-UA-v0.2.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.2.1.apk | tee SafeNav-Offline-Kyiv-v0.2.1.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.2.1.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-ua-v0.2 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-ua-v0.2 \
-            SafeNav-Offline-UA-v0.2.apk \
-            SafeNav-Offline-UA-v0.2.sha256 \
+          gh release delete safenav-offline-kyiv-v0.2.1 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.2.1 \
+            SafeNav-Offline-Kyiv-v0.2.1.apk \
+            SafeNav-Offline-Kyiv-v0.2.1.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline UA v0.2" \
+            --title "SafeNav Offline Kyiv v0.2.1" \
             --notes "Fully offline Ukraine navigation build. Ukraine MWM maps are bundled in the APK. INTERNET and ACCESS_NETWORK_STATE permissions are absent."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-UA-v0.2
+          name: SafeNav-Offline-Kyiv-v0.2.1
           path: |
-            SafeNav-Offline-UA-v0.2.apk
-            SafeNav-Offline-UA-v0.2.sha256
+            SafeNav-Offline-Kyiv-v0.2.1.apk
+            SafeNav-Offline-Kyiv-v0.2.1.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
