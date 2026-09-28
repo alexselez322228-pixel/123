@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.2.2
+name: Build SafeNav Offline Kyiv v0.3.0 stable
 
 on:
   push:
@@ -115,74 +115,13 @@ jobs:
           # No native LocalCountryFile injection in this build.
           PY
 
-      - name: Bundle all Ukraine maps
+      - name: Prepare stable offline build
         run: |
           cd om
-          mkdir -p android/app/src/fdroid/assets
-          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
-          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
-
-          python3 - <<'PY'
-          import json, os, subprocess, urllib.parse
-          from pathlib import Path
-
-          data = json.load(open("data/countries.json", encoding="utf-8"))
-          def find(node):
-              if isinstance(node, dict):
-                  if node.get("id") == "Ukraine":
-                      return node
-                  for v in node.values():
-                      r = find(v)
-                      if r: return r
-              elif isinstance(node, list):
-                  for v in node:
-                      r = find(v)
-                      if r: return r
-              return None
-
-          ua = find(data)
-          if not ua:
-              raise SystemExit("Ukraine node not found")
-
-          version = str(data["v"])
-          dest = Path("android/app/src/fdroid/assets")
-          mirrors = [
-              "https://cdn.organicmaps.app/",
-              "https://cdn-nl1.organicmaps.app/",
-              "https://cdn-uk1.organicmaps.app/",
-          ]
-
-          total = 0
-          selected = [entry for entry in ua["g"] if entry["id"] == "Ukraine_Kyiv Oblast"]
-          if len(selected) != 1:
-              raise SystemExit("Kyiv Oblast map not found")
-          for entry in selected:
-              filename = entry["id"] + ".mwm"
-              expected = int(entry["s"])
-              out = dest / filename
-              encoded = urllib.parse.quote(filename, safe="_.-")
-              ok = False
-              for mirror in mirrors:
-                  url = f"{mirror}maps/{version}/{encoded}"
-                  print("Downloading", url, flush=True)
-                  rc = subprocess.run([
-                      "curl", "-fL", "--retry", "3", "--retry-delay", "2",
-                      "--connect-timeout", "20", "-o", str(out), url
-                  ]).returncode
-                  if rc == 0 and out.exists() and out.stat().st_size == expected:
-                      ok = True
-                      break
-                  if out.exists():
-                      out.unlink()
-              if not ok:
-                  raise SystemExit(f"Failed or wrong size: {filename} expected={expected}")
-              total += expected
-
-          print(f"Bundled Kyiv Oblast map, {total} bytes")
-          PY
-
-          du -sh android/app/src/fdroid/assets
-          ls -lh android/app/src/fdroid/assets | head -40
+          # First priority: a clean, launchable navigator. Do not inject MWM files
+          # into APK assets; Organic Maps does not support arbitrary asset injection
+          # as installed local maps and the previous approach crashed on-device.
+          echo "Building clean SafeNav shell without unsupported map injection"
 
       - name: Build arm64 APK
         working-directory: om/android
@@ -195,10 +134,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-Kyiv-v0.2.2.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.3.0.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.2.2.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.0.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -209,33 +148,29 @@ jobs:
             exit 1
           fi
 
-          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.2.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
-          echo "Bundled MWM count: $COUNT"
-          test "$COUNT" -ge 3
-
-          sha256sum SafeNav-Offline-Kyiv-v0.2.2.apk | tee SafeNav-Offline-Kyiv-v0.2.2.sha256
-          ls -lh SafeNav-Offline-Kyiv-v0.2.2.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.3.0.apk | tee SafeNav-Offline-Kyiv-v0.3.0.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.3.0.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-kyiv-v0.2.2 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-kyiv-v0.2.2 \
-            SafeNav-Offline-Kyiv-v0.2.2.apk \
-            SafeNav-Offline-Kyiv-v0.2.2.sha256 \
+          gh release delete safenav-offline-kyiv-v0.3.0 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.3.0 \
+            SafeNav-Offline-Kyiv-v0.3.0.apk \
+            SafeNav-Offline-Kyiv-v0.3.0.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline Kyiv v0.2.2" \
-            --notes "Fully offline Ukraine navigation build. Ukraine MWM maps are bundled in the APK. INTERNET and ACCESS_NETWORK_STATE permissions are absent."
+            --title "SafeNav Offline Kyiv v0.3.0" \
+            --notes "Stable SafeNav launcher build. Unsupported direct MWM asset injection was removed after on-device Xiaomi crash testing. INTERNET and ACCESS_NETWORK_STATE permissions remain absent."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-Kyiv-v0.2.2
+          name: SafeNav-Offline-Kyiv-v0.3.0
           path: |
-            SafeNav-Offline-Kyiv-v0.2.2.apk
-            SafeNav-Offline-Kyiv-v0.2.2.sha256
+            SafeNav-Offline-Kyiv-v0.3.0.apk
+            SafeNav-Offline-Kyiv-v0.3.0.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
