@@ -1,0 +1,443 @@
+name: Build NavShlyah UA Offline Kyiv v0.3.4
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/safenav-offline-kyiv-v033.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk/* /opt/ghc /usr/local/share/boost || true
+          docker system prune -af || true
+          df -h
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build ccache curl unzip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;29.0.14206865"
+
+      - name: Fetch Organic Maps source
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/organicmaps/organicmaps.git om
+          cd om
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/29.0.14206865" >> android/local.properties
+
+      - name: Patch NavShlyah UA branding, Ukrainian UI, offline map and inertial mode
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          root = Path("om")
+
+          # 1) Offline permissions: no INTERNET, keep ACCESS_NETWORK_STATE because
+          # Organic Maps' platform init queries ConnectivityManager.
+          for mf in root.glob("android/**/AndroidManifest.xml"):
+              ms = mf.read_text(encoding="utf-8")
+              original = ms
+              ms = re.sub(
+                  r'\s*<uses-permission\s+android:name="android.permission.INTERNET"(?:\s+[^>]*)?/?>\s*',
+                  '\n', ms
+              )
+              if mf == root / "android/app/src/main/AndroidManifest.xml":
+                  ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+                  ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
+                  ms = ms.replace('android:icon="@mipmap/ic_launcher"', 'android:icon="@drawable/logo"')
+                  m = re.search(r'<manifest\b[^>]*>', ms, flags=re.S)
+                  if not m:
+                      raise SystemExit("Could not locate opening <manifest> tag")
+                  removal = '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n'
+                  ms = ms[:m.end()] + removal + ms[m.end():]
+              if ms != original:
+                  mf.write_text(ms, encoding="utf-8")
+
+          main_manifest = root / "android/app/src/main/AndroidManifest.xml"
+          ET.parse(main_manifest)
+          main_text = main_manifest.read_text(encoding="utf-8")
+          if 'android.permission.ACCESS_NETWORK_STATE' not in main_text:
+              raise SystemExit("ACCESS_NETWORK_STATE missing")
+
+          # 2) Own package id and remove INTERNET from Organic Maps permission verifier.
+          gradle = root / "android/app/build.gradle"
+          gs = gradle.read_text(encoding="utf-8")
+          gs = gs.replace("    \"name='android.permission.INTERNET'\",\n", "")
+          marker = "defaultConfig {"
+          p = gs.find(marker)
+          if p < 0:
+              raise SystemExit("defaultConfig not found")
+          gs = gs[:p+len(marker)] + "\n    applicationId 'ua.navshlyah.offline'\n" + gs[p+len(marker):]
+          gradle.write_text(gs, encoding="utf-8")
+
+          # 3) Brand app as НавШлях UA everywhere.
+          for path in root.glob("android/app/src/main/res/values*/strings.xml"):
+              txt = path.read_text(encoding="utf-8")
+              txt = re.sub(r'(<string\s+name="app_name"[^>]*>).*?(</string>)',
+                           r'\1НавШлях UA\2', txt, count=1, flags=re.S)
+              path.write_text(txt, encoding="utf-8")
+
+          uk = root / "android/app/src/main/res/values-uk/strings.xml"
+          txt = uk.read_text(encoding="utf-8")
+          replacements = {
+              "about_menu_title": "Про НавШлях UA",
+              "about_headline": "Офлайн-навігатор для України",
+              "about_proposition_1": "• Київ і Київська область уже всередині застосунку",
+              "about_proposition_2": "• Маршрут і карта працюють без інтернету",
+              "about_proposition_3": "• Початкова позиція визначається GPS, далі працює інерційний режим",
+              "about_developed_by_enthusiasts": "НавШлях UA використовує відкриті картографічні дані OpenStreetMap та компоненти Organic Maps.",
+          }
+          for key, value in replacements.items():
+              txt = re.sub(
+                  rf'(<string\s+name="{re.escape(key)}"[^>]*>).*?(</string>)',
+                  lambda m, v=value: m.group(1) + v + m.group(2),
+                  txt, count=1, flags=re.S
+              )
+          # Replace remaining visible Organic Maps brand references in Ukrainian resources,
+          # while preserving required attribution in the About/legal text above.
+          txt = txt.replace("Organic Maps", "НавШлях UA")
+          uk.write_text(txt, encoding="utf-8")
+
+          # 4) Force Ukrainian locale regardless of device language.
+          app = root / "android/app/src/main/java/app/organicmaps/MwmApplication.java"
+          js = app.read_text(encoding="utf-8")
+          if "android.content.res.Configuration" not in js:
+              js = js.replace("import android.content.Context;\n",
+                              "import android.content.Context;\nimport android.content.res.Configuration;\n")
+          if "import java.util.Locale;" not in js:
+              js = js.replace("import java.lang.ref.WeakReference;\n",
+                              "import java.lang.ref.WeakReference;\nimport java.util.Locale;\n")
+          anchor = "public class MwmApplication extends Application implements Application.ActivityLifecycleCallbacks\n{\n"
+          method = """public class MwmApplication extends Application implements Application.ActivityLifecycleCallbacks
+{
+  @Override
+  protected void attachBaseContext(Context base)
+  {
+    Locale locale = Locale.forLanguageTag("uk");
+    Locale.setDefault(locale);
+    Configuration config = new Configuration(base.getResources().getConfiguration());
+    config.setLocale(locale);
+    super.attachBaseContext(base.createConfigurationContext(config));
+  }
+
+"""
+          if anchor not in js:
+              raise SystemExit("MwmApplication class anchor not found")
+          js = js.replace(anchor, method, 1)
+          app.write_text(js, encoding="utf-8")
+
+          # 5) Replace Organic Maps logo with a simple НавШлях navigation mark.
+          logo = root / "android/app/src/main/res/drawable/logo.xml"
+          logo.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+  <path android:fillColor="#0057B7" android:pathData="M54,6 L94,96 L54,78 L14,96 Z"/>
+  <path android:fillColor="#FFD700" android:pathData="M54,24 L74,70 L54,61 L34,70 Z"/>
+</vector>
+""", encoding="utf-8")
+
+          # Hide donation/social-promotional controls from About. Keep OSM/legal attribution.
+          about = root / "android/app/src/main/res/layout/about.xml"
+          ax = about.read_text(encoding="utf-8")
+          hide_ids = ["donate","support_us","news","rate","telegram","github","web","email",
+                      "matrix","mastodon","facebook","twitter","instagram"]
+          for vid in hide_ids:
+              token = f'android:id="@+id/{vid}"'
+              if token in ax and f'{token}\n        android:visibility="gone"' not in ax:
+                  ax = ax.replace(token, token + '\n        android:visibility="gone"', 1)
+          about.write_text(ax, encoding="utf-8")
+
+          # 6) Register the bundled Kyiv Oblast .mwm as an installed/resource-backed map,
+          # so the UI does not offer a network download for a map already inside the APK.
+          cpp = root / "libs/platform/local_country_file_utils.cpp"
+          cs = cpp.read_text(encoding="utf-8")
+          anchor = "  // Check for World and WorldCoasts in app bundle or in resources.\n"
+          idx = cs.find(anchor)
+          end_anchor = "\nvoid CleanupMapsDirectory(int64_t latestVersion)"
+          endp = cs.find(end_anchor, idx)
+          if idx < 0 or endp < 0:
+              raise SystemExit("Bundled map patch anchor not found")
+          block_end = cs.rfind("\n}", idx, endp)
+          if block_end < 0:
+              raise SystemExit("Bundled map function closing brace not found")
+          bundled = r'''
+  // НавШлях UA: Kyiv Oblast is bundled directly inside the APK.
+  try
+  {
+    std::string const fileName("Ukraine_Kyiv Oblast");
+    ModelReaderPtr reader(platform.GetReader(fileName + DATA_FILE_EXTENSION, "r"));
+    LocalCountryFile bundledFile(std::string(), CountryFile(fileName), version::ReadVersionDate(reader));
+    bundledFile.m_files[base::Underlying(MapFileType::Map)] = reader.Size();
+
+    auto existing = std::find_if(localFiles.begin(), localFiles.end(),
+                                 [&fileName](LocalCountryFile const & f)
+                                 { return f.GetCountryName() == fileName; });
+    if (existing == localFiles.end())
+      localFiles.push_back(std::move(bundledFile));
+    else if (bundledFile.GetVersion() > existing->GetVersion())
+      *existing = std::move(bundledFile);
+  }
+  catch (RootException const & ex)
+  {
+    LOG(LWARNING, ("NavShlyah bundled Kyiv map missing:", ex.Msg()));
+  }
+'''
+          cs = cs[:block_end] + bundled + cs[block_end:]
+          cpp.write_text(cs, encoding="utf-8")
+
+          # 7) Experimental one-fix + inertial dead-reckoning provider.
+          # GPS supplies only the initial accepted fix. Afterwards the provider advances
+          # position from phone heading + step detector; when the initial fix includes
+          # vehicle speed, that speed is extrapolated between sensor updates.
+          provider = root / "android/sdk/src/main/java/app/organicmaps/sdk/location/DeadReckoningProvider.java"
+          provider.write_text(r'''package app.organicmaps.sdk.location;
+
+import android.content.Context;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import androidx.annotation.NonNull;
+import androidx.annotation.RequiresPermission;
+
+final class DeadReckoningProvider extends BaseLocationProvider implements SensorEventListener
+{
+  private static final double EARTH_RADIUS_M = 6378137.0;
+  private static final float STEP_METERS = 0.75f;
+
+  @NonNull private final SensorManager mSensorManager;
+  @NonNull private final Handler mHandler = new Handler(Looper.getMainLooper());
+  @NonNull private final Location mLocation;
+  private Sensor mRotation;
+  private Sensor mStep;
+  private double mHeadingRad;
+  private float mSpeedMps;
+  private long mLastTickNanos;
+  private boolean mRunning;
+
+  DeadReckoningProvider(@NonNull Context context, @NonNull Listener listener, @NonNull Location seed)
+  {
+    super(listener);
+    mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+    mLocation = new Location(seed);
+    mSpeedMps = seed.hasSpeed() ? Math.max(0.0f, seed.getSpeed()) : 0.0f;
+    mHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
+  }
+
+  @Override
+  @RequiresPermission(anyOf = {"android.permission.ACCESS_COARSE_LOCATION", "android.permission.ACCESS_FINE_LOCATION"})
+  protected void start(long interval)
+  {
+    if (mRunning)
+      return;
+    mRunning = true;
+    mRotation = mSensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+    if (mRotation == null)
+      mRotation = mSensorManager.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR);
+    mStep = mSensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR);
+    if (mRotation != null)
+      mSensorManager.registerListener(this, mRotation, SensorManager.SENSOR_DELAY_GAME);
+    if (mStep != null)
+      mSensorManager.registerListener(this, mStep, SensorManager.SENSOR_DELAY_NORMAL);
+    mLastTickNanos = SystemClock.elapsedRealtimeNanos();
+    mHandler.post(mTicker);
+  }
+
+  @Override
+  protected void stop()
+  {
+    if (!mRunning)
+      return;
+    mRunning = false;
+    mHandler.removeCallbacks(mTicker);
+    mSensorManager.unregisterListener(this);
+  }
+
+  private final Runnable mTicker = new Runnable()
+  {
+    @Override public void run()
+    {
+      if (!mRunning)
+        return;
+      final long now = SystemClock.elapsedRealtimeNanos();
+      final double dt = Math.max(0.0, Math.min(2.0, (now - mLastTickNanos) / 1.0e9));
+      mLastTickNanos = now;
+
+      // Vehicle mode: continue from the speed reported by the initial GPS fix.
+      if (mSpeedMps >= 2.0f && dt > 0.0)
+      {
+        advance(mSpeedMps * dt);
+        emit(now);
+      }
+      mHandler.postDelayed(this, 1000);
+    }
+  };
+
+  @Override
+  public void onSensorChanged(SensorEvent event)
+  {
+    if (!mRunning)
+      return;
+
+    if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR ||
+        event.sensor.getType() == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
+    {
+      float[] rotation = new float[9];
+      float[] orientation = new float[3];
+      SensorManager.getRotationMatrixFromVector(rotation, event.values);
+      SensorManager.getOrientation(rotation, orientation);
+      mHeadingRad = orientation[0];
+    }
+    else if (event.sensor.getType() == Sensor.TYPE_STEP_DETECTOR && mSpeedMps < 2.0f)
+    {
+      advance(STEP_METERS);
+      emit(SystemClock.elapsedRealtimeNanos());
+    }
+  }
+
+  @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
+  private void advance(double meters)
+  {
+    if (meters <= 0.0)
+      return;
+    double lat = Math.toRadians(mLocation.getLatitude());
+    double lon = Math.toRadians(mLocation.getLongitude());
+    double d = meters / EARTH_RADIUS_M;
+    lat += d * Math.cos(mHeadingRad);
+    double cosLat = Math.max(0.01, Math.cos(lat));
+    lon += d * Math.sin(mHeadingRad) / cosLat;
+    mLocation.setLatitude(Math.toDegrees(lat));
+    mLocation.setLongitude(Math.toDegrees(lon));
+    mLocation.setBearing((float)((Math.toDegrees(mHeadingRad) + 360.0) % 360.0));
+    if (mSpeedMps >= 2.0f)
+      mLocation.setSpeed(mSpeedMps);
+    float accuracy = mLocation.hasAccuracy() ? mLocation.getAccuracy() : 20.0f;
+    mLocation.setAccuracy(Math.min(500.0f, accuracy + 1.0f));
+  }
+
+  private void emit(long elapsedNanos)
+  {
+    mLocation.setProvider("navshlyah_inertial");
+    mLocation.setTime(System.currentTimeMillis());
+    mLocation.setElapsedRealtimeNanos(elapsedNanos);
+    mListener.onLocationChanged(new Location(mLocation));
+  }
+}
+''', encoding="utf-8")
+
+          helper = root / "android/sdk/src/main/java/app/organicmaps/sdk/location/LocationHelper.java"
+          hs = helper.read_text(encoding="utf-8")
+          old = """    mSavedLocation = location;
+    mMyPosition = null;
+    notifyLocationUpdated();
+  }
+"""
+          new = """    mSavedLocation = location;
+    mMyPosition = null;
+    notifyLocationUpdated();
+
+    // НавШлях UA privacy mode: after the first accepted real location fix,
+    // switch off GNSS/network polling and continue with local phone sensors.
+    if (!(mLocationProvider instanceof DeadReckoningProvider))
+    {
+      Logger.i(TAG, "Initial location acquired; switching to local inertial tracking");
+      final Location seed = new Location(mSavedLocation);
+      mLocationProvider.stop();
+      unsubscribeFromGnssStatusUpdates();
+      mLocationProvider = new DeadReckoningProvider(mContext, this, seed);
+      mInterval = 1000;
+      mLocationProvider.start(mInterval);
+    }
+  }
+"""
+          if old not in hs:
+              raise SystemExit("LocationHelper onLocationChanged anchor not found")
+          hs = hs.replace(old, new, 1)
+          helper.write_text(hs, encoding="utf-8")
+          PY
+
+      - name: Bundle Kyiv and Kyiv Oblast map
+        run: |
+          cd om
+          mkdir -p android/app/src/fdroid/assets
+          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
+          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
+
+          VERSION=$(python3 -c 'import json; print(json.load(open("data/countries.json"))["v"])')
+          SIZE=$(python3 -c 'import json; d=json.load(open("data/countries.json")); u=next(x for x in d["g"] if x["id"]=="Ukraine"); print(next(x["s"] for x in u["g"] if x["id"]=="Ukraine_Kyiv Oblast"))')
+
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+            -o "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm" \
+            "https://cdn.organicmaps.app/maps/$VERSION/Ukraine_Kyiv%20Oblast.mwm"
+
+          test "$(stat -c%s "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm")" = "$SIZE"
+          du -sh android/app/src/fdroid/assets
+
+      - name: Build arm64 APK
+        working-directory: om/android
+        env:
+          CI: "true"
+        run: |
+          ./gradlew --no-daemon --stacktrace -Parm64 -Pnjobs=2 -Pfirebase=false :app:assembleFdroidProfileable
+
+      - name: Collect and verify APK
+        run: |
+          APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
+          test -n "$APK"
+          cp "$APK" NavShlyah-UA-Kyiv-v0.3.4.apk
+
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          "$AAPT" dump permissions NavShlyah-UA-Kyiv-v0.3.4.apk | tee permissions.txt
+
+          if grep -q "android.permission.INTERNET" permissions.txt; then
+            echo "ERROR: INTERNET permission found"
+            exit 1
+          fi
+          if ! grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE permission missing"
+            exit 1
+          fi
+
+          COUNT="$(unzip -l NavShlyah-UA-Kyiv-v0.3.4.apk | grep -c 'assets/.*\.mwm')"
+          echo "Bundled MWM count: $COUNT"
+          test "$COUNT" -ge 3
+
+          sha256sum NavShlyah-UA-Kyiv-v0.3.4.apk | tee NavShlyah-UA-Kyiv-v0.3.4.sha256
+          ls -lh NavShlyah-UA-Kyiv-v0.3.4.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NavShlyah-UA-Kyiv-v0.3.4
+          path: |
+            NavShlyah-UA-Kyiv-v0.3.4.apk
+            NavShlyah-UA-Kyiv-v0.3.4.sha256
+            permissions.txt
+          compression-level: 0
+          if-no-files-found: error
