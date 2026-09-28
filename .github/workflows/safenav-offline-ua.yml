@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.2 fixed
+name: Build SafeNav Offline Kyiv v0.3.2 manifest-fix
 
 on:
   push:
@@ -46,28 +46,43 @@ jobs:
 
           root = Path("om")
 
-          # 1) SafeNav remains offline, but Organic Maps SDK requires ACCESS_NETWORK_STATE
-          # during native platform initialization. Keep INTERNET removed, while allowing
-          # the non-networking connectivity-state permission.
+          # 1) SafeNav remains offline, but Organic Maps SDK requires ACCESS_NETWORK_STATE.
+          # Remove INTERNET from source manifests. In the app manifest also add a merger
+          # removal rule so dependencies cannot re-introduce INTERNET, while retaining
+          # ACCESS_NETWORK_STATE (this permission does not itself grant network access).
           for mf in root.glob("android/**/AndroidManifest.xml"):
               ms = mf.read_text(encoding="utf-8")
               original = ms
               ms = re.sub(
                   r'\s*<uses-permission\s+android:name="android.permission.INTERNET"(?:\s+[^>]*)?/?>\s*',
-                  '\\n', ms
+                  '\n', ms
               )
               if mf == root / "android/app/src/main/AndroidManifest.xml":
                   ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
                   ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
-                  # Reject INTERNET from merged dependencies, but explicitly retain
-                  # ACCESS_NETWORK_STATE required by Organic Maps ConnectionState.
-                  removal_node = '\\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\\n'
-                  access_node = '  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\\n'
-                  ms, n = re.subn(r'(<manifest\b[^>]*>)', r'\\1' + removal_node + access_node, ms, count=1, flags=re.S)
-                  if n != 1:
+
+                  # Insert real XML lines after the opening <manifest> tag.
+                  # Do not use a regex replacement backreference here: an earlier build
+                  # accidentally wrote literal "\\1" / "\\n" text into the XML prolog.
+                  m = re.search(r'<manifest\b[^>]*>', ms, flags=re.S)
+                  if not m:
                       raise SystemExit("Could not locate opening <manifest> tag")
+                  removal_node = '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n'
+                  access_node = '  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n'
+                  ms = ms[:m.end()] + removal_node + access_node + ms[m.end():]
+
               if ms != original:
                   mf.write_text(ms, encoding="utf-8")
+
+          # Fail immediately if our patch produced malformed XML, before downloading maps/building.
+          import xml.etree.ElementTree as ET
+          main_manifest = root / "android/app/src/main/AndroidManifest.xml"
+          ET.parse(main_manifest)
+          main_text = main_manifest.read_text(encoding="utf-8")
+          if "\\1" in main_text or "\\n" in main_text:
+              raise SystemExit("Manifest contains escaped patch artifacts")
+          if 'android.permission.ACCESS_NETWORK_STATE' not in main_text:
+              raise SystemExit("ACCESS_NETWORK_STATE missing after manifest patch")
 
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
