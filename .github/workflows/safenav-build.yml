@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.1 stable
+name: Build SafeNav Offline Kyiv v0.3.2 stable
 
 on:
   push:
@@ -145,13 +145,17 @@ jobs:
           # No native LocalCountryFile injection in this build.
           PY
 
-      - name: Prepare stable offline build
+      - name: Bundle Kyiv Oblast map
         run: |
           cd om
-          # First priority: a clean, launchable navigator. Do not inject MWM files
-          # into APK assets; Organic Maps does not support arbitrary asset injection
-          # as installed local maps and the previous approach crashed on-device.
-          echo "Building clean SafeNav shell without unsupported map injection"
+          mkdir -p android/app/src/fdroid/assets
+          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
+          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
+          VERSION=$(python3 -c 'import json; print(json.load(open("data/countries.json"))["v"])')
+          SIZE=$(python3 -c 'import json; d=json.load(open("data/countries.json")); u=next(x for x in d["g"] if x["id"]=="Ukraine"); print(next(x["s"] for x in u["g"] if x["id"]=="Ukraine_Kyiv Oblast"))')
+          curl -fL --retry 3 -o "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm" "https://cdn.organicmaps.app/maps/$VERSION/Ukraine_Kyiv%20Oblast.mwm"
+          test "$(stat -c%s "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm")" = "$SIZE"
+          du -sh android/app/src/fdroid/assets
 
       - name: Build arm64 APK
         working-directory: om/android
@@ -164,10 +168,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-Kyiv-v0.3.1.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.3.2.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.1.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.2.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -178,29 +182,32 @@ jobs:
             exit 1
           fi
 
-          sha256sum SafeNav-Offline-Kyiv-v0.3.1.apk | tee SafeNav-Offline-Kyiv-v0.3.1.sha256
-          ls -lh SafeNav-Offline-Kyiv-v0.3.1.apk
+          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.3.2.apk | grep -c 'assets/.*\.mwm')"
+          echo "Bundled MWM count: $COUNT"
+          test "$COUNT" -ge 3
+          sha256sum SafeNav-Offline-Kyiv-v0.3.2.apk | tee SafeNav-Offline-Kyiv-v0.3.2.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.3.2.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-kyiv-v0.3.1 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-kyiv-v0.3.1 \
-            SafeNav-Offline-Kyiv-v0.3.1.apk \
-            SafeNav-Offline-Kyiv-v0.3.1.sha256 \
+          gh release delete safenav-offline-kyiv-v0.3.2 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.3.2 \
+            SafeNav-Offline-Kyiv-v0.3.2.apk \
+            SafeNav-Offline-Kyiv-v0.3.2.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline Kyiv v0.3.1" \
+            --title "SafeNav Offline Kyiv v0.3.2" \
             --notes "Stable SafeNav launcher build. Unsupported direct MWM asset injection was removed after on-device Xiaomi crash testing. INTERNET and ACCESS_NETWORK_STATE permissions remain absent."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-Kyiv-v0.3.1
+          name: SafeNav-Offline-Kyiv-v0.3.2
           path: |
-            SafeNav-Offline-Kyiv-v0.3.1.apk
-            SafeNav-Offline-Kyiv-v0.3.1.sha256
+            SafeNav-Offline-Kyiv-v0.3.2.apk
+            SafeNav-Offline-Kyiv-v0.3.2.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
