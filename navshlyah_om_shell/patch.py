@@ -40,6 +40,49 @@ dst=root/"android/sdk/src/main/java/app/organicmaps/sdk/location/DeadReckoningPr
 shutil.copy(repo/"safenav_patches/v034/DeadReckoningProvider.java",dst)
 helper=root/"android/sdk/src/main/java/app/organicmaps/sdk/location/LocationHelper.java"
 hs=helper.read_text(encoding="utf-8")
+
+# Add an explicit one-shot GNSS refresh API. It temporarily replaces the inertial
+# provider, accepts one real fix, then the onLocationChanged patch below switches
+# immediately back to DeadReckoningProvider.
+hs=hs.replace(
+    "  private boolean mActive;\n  private final Handler mHandler;",
+    "  private boolean mActive;\n  private boolean mNavShlyahOneShotGps;\n  private final Handler mHandler;",
+    1)
+hs=hs.replace(
+    """    if (mSavedLocation != null)
+    {
+      if (!LocationUtils.isLocationBetterThanLast(location, mSavedLocation))""",
+    """    if (!mNavShlyahOneShotGps && mSavedLocation != null)
+    {
+      if (!LocationUtils.isLocationBetterThanLast(location, mSavedLocation))""",
+    1)
+gps_method=r'''
+  /**
+   * NavShlyah UA: request exactly one fresh GNSS fix. After a valid fix is
+   * delivered, onLocationChanged() switches back to the local inertial provider.
+   */
+  @SuppressLint("MissingPermission")
+  public void requestOneShotGpsFix()
+  {
+    Logger.i(TAG, "NavShlyah: request one-shot GNSS fix");
+    mNavShlyahOneShotGps = true;
+    mLocationProvider.stop();
+    unsubscribeFromGnssStatusUpdates();
+    mLocationProvider = new AndroidNativeProvider(mContext, this);
+    mInterval = 1000;
+    mActive = true;
+    mLocationProvider.start(mInterval);
+    subscribeToGnssStatusUpdates();
+    mHandler.removeCallbacks(mLocationTimeoutRunnable);
+    mHandler.postDelayed(mLocationTimeoutRunnable, LOCATION_UPDATE_TIMEOUT_MS);
+  }
+
+'''
+anchor="  /**\n   * Restart the location with a new refresh interval if changed.\n   */"
+if anchor not in hs:
+    raise SystemExit("LocationHelper method anchor not found")
+hs=hs.replace(anchor,gps_method+anchor,1)
+
 old="""    mSavedLocation = location;
     mMyPosition = null;
     notifyLocationUpdated();
@@ -48,6 +91,7 @@ old="""    mSavedLocation = location;
 new="""    mSavedLocation = location;
     mMyPosition = null;
     notifyLocationUpdated();
+    mNavShlyahOneShotGps = false;
 
     // NavShlyah UA: one real location fix, then local inertial tracking only.
     if (!(mLocationProvider instanceof DeadReckoningProvider))
