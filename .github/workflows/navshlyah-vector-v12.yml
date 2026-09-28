@@ -1,10 +1,11 @@
-name: Build NavShlyah UA Vector v1.3
+name: Build NavShlyah UA Vector v1.4
 
 on:
   push:
     branches: [main]
     paths:
       - 'navshlyah_om_shell/**'
+      - 'safenav_patches/v034/DeadReckoningProvider.java'
       - '.github/workflows/navshlyah-vector-v12.yml'
   workflow_dispatch:
 
@@ -70,10 +71,10 @@ jobs:
         run: |
           APK="$(find om/android/navshlyah/build/outputs/apk -type f -name '*.apk' | head -1)"
           test -n "$APK"
-          cp "$APK" NavShlyah-UA-Vector-v1.3.apk
+          cp "$APK" NavShlyah-UA-Vector-v1.4.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions NavShlyah-UA-Vector-v1.3.apk | tee permissions.txt
+          "$AAPT" dump permissions NavShlyah-UA-Vector-v1.4.apk | tee permissions.txt
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
             exit 1
@@ -83,30 +84,30 @@ jobs:
             exit 1
           fi
 
-          COUNT="$(unzip -l NavShlyah-UA-Vector-v1.3.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          COUNT="$(unzip -l NavShlyah-UA-Vector-v1.4.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
           echo "Bundled MWM count: $COUNT"
           test "$COUNT" -ge 3
 
-          unzip -lv NavShlyah-UA-Vector-v1.3.apk | grep 'Ukraine_Kyiv Oblast.mwm' | tee mwm-packaging.txt
+          unzip -lv NavShlyah-UA-Vector-v1.4.apk | grep 'Ukraine_Kyiv Oblast.mwm' | tee mwm-packaging.txt
           grep -q 'Stored' mwm-packaging.txt
 
-          sha256sum NavShlyah-UA-Vector-v1.3.apk | tee NavShlyah-UA-Vector-v1.3.sha256
-          ls -lh NavShlyah-UA-Vector-v1.3.apk
+          sha256sum NavShlyah-UA-Vector-v1.4.apk | tee NavShlyah-UA-Vector-v1.4.sha256
+          ls -lh NavShlyah-UA-Vector-v1.4.apk
 
       - name: Create project archive
         run: |
-          printf '%s\n' "NavShlyah UA Vector v1.3"             "Own package: ua.navshlyah.app"             "Build: GitHub Actions workflow included"             "Organic Maps SDK source is fetched and patched during build."             "Kyiv vector MWM is bundled during build."             > PROJECT-README.txt
+          printf '%s\n' "NavShlyah UA Vector v1.4"             "Own package: ua.navshlyah.app"             "Build: GitHub Actions workflow included"             "Organic Maps SDK source is fetched and patched during build."             "Kyiv vector MWM is bundled during build."             > PROJECT-README.txt
           git -C om rev-parse HEAD > ORGANIC_MAPS_COMMIT.txt
-          zip -r NavShlyah-UA-Vector-v1.3-project.zip             navshlyah_om_shell             .github/workflows/navshlyah-vector-v12.yml             PROJECT-README.txt             ORGANIC_MAPS_COMMIT.txt
-          ls -lh NavShlyah-UA-Vector-v1.3-project.zip
+          zip -r NavShlyah-UA-Vector-v1.4-project.zip             navshlyah_om_shell             safenav_patches/v034/DeadReckoningProvider.java             .github/workflows/navshlyah-vector-v12.yml             PROJECT-README.txt             ORGANIC_MAPS_COMMIT.txt
+          ls -lh NavShlyah-UA-Vector-v1.4-project.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NavShlyah-UA-Vector-v1.3
+          name: NavShlyah-UA-Vector-v1.4
           path: |
-            NavShlyah-UA-Vector-v1.3.apk
-            NavShlyah-UA-Vector-v1.3.sha256
-            NavShlyah-UA-Vector-v1.3-project.zip
+            NavShlyah-UA-Vector-v1.4.apk
+            NavShlyah-UA-Vector-v1.4.sha256
+            NavShlyah-UA-Vector-v1.4-project.zip
             permissions.txt
             mwm-packaging.txt
           compression-level: 0
