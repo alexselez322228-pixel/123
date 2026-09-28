@@ -6,6 +6,7 @@ src, out = Path(sys.argv[1]), Path(sys.argv[2])
 nodes = {}
 coords = []
 edges = []
+ROAD_CLASS = {"motorway":0,"motorway_link":0,"trunk":1,"trunk_link":1,"primary":2,"primary_link":2,"secondary":3,"secondary_link":3,"tertiary":4,"tertiary_link":4,"residential":5,"living_street":5,"unclassified":6,"service":7}
 
 ALLOWED = {
     "motorway","motorway_link","trunk","trunk_link","primary","primary_link",
@@ -47,19 +48,20 @@ with src.open("r", encoding="utf-8") as f:
         for i in range(len(ids)-1):
             a,b=ids[i],ids[i+1]
             w=max(1,min(65535,int(round(dist(coords[a],coords[b])))))
-            if rev: edges.append((b,a,w))
+            cls=ROAD_CLASS.get(hw,7)
+            if rev: edges.append((b,a,w,cls))
             else:
-                edges.append((a,b,w))
-                if not one: edges.append((b,a,w))
+                edges.append((a,b,w,cls))
+                if not one: edges.append((b,a,w,cls))
 
 out.parent.mkdir(parents=True,exist_ok=True)
 with out.open("wb") as f:
-    f.write(b"NSG1")
+    f.write(b"NSG2")
     f.write(struct.pack("<II",len(coords),len(edges)))
     for lat,lon in coords:
         f.write(struct.pack("<ii",round(lat*1_000_000),round(lon*1_000_000)))
-    for a,b,w in edges:
-        f.write(struct.pack("<IIH",a,b,w))
+    for a,b,w,cls in edges:
+        f.write(struct.pack("<IIHB",a,b,w,cls))
 print("nodes",len(coords),"edges",len(edges),"bytes",out.stat().st_size)
 if len(coords) < 1000 or len(edges) < 1000:
     raise SystemExit("Road graph unexpectedly empty/small")
