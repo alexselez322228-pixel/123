@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.2 stable
+name: Build SafeNav Hybrid Kyiv v0.4.0 stable
 
 on:
   push:
@@ -47,79 +47,15 @@ jobs:
 
           root = Path("om")
 
-          # 1) Strong offline/privacy manifests: remove network capability from every module
-          # before Android Manifest Merger runs.
-          for mf in root.glob("android/**/AndroidManifest.xml"):
-              ms = mf.read_text(encoding="utf-8")
-              original = ms
-              for perm in (
-                  "android.permission.INTERNET",
-                  "android.permission.ACCESS_NETWORK_STATE",
-              ):
-                  ms = re.sub(
-                      r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"(?:\s+[^>]*)?/?>\s*',
-                      '\n',
-                      ms
-                  )
-              if mf == root / "android/app/src/main/AndroidManifest.xml":
-                  ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
-                  ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
-                  # Force Manifest Merger to reject network permissions supplied by external AARs.
-                  removal_nodes = (
-                      '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>'
-                      '\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n'
-                  )
-                  ms, n = re.subn(r'(<manifest\b[^>]*>)', r'\1' + removal_nodes, ms, count=1, flags=re.S)
-                  if n != 1:
-                      raise SystemExit("Could not locate opening <manifest> tag")
-              if ms != original:
-                  mf.write_text(ms, encoding="utf-8")
+          # 1) Hybrid mode: keep Organic Maps network permissions for map downloads.
 
-          # 1b) Organic Maps has its own APK permission whitelist. SafeNav is intentionally
-          # offline, so INTERNET and ACCESS_NETWORK_STATE must not be required by that check.
-          app_gradle = root / "android/app/build.gradle"
-          ag = app_gradle.read_text(encoding="utf-8")
-          ag = ag.replace('    "name=\'android.permission.INTERNET\'",\n', '')
-          ag = ag.replace('    "name=\'android.permission.ACCESS_NETWORK_STATE\'",\n', '')
-          app_gradle.write_text(ag, encoding="utf-8")
+          # 1b) Keep the upstream permission whitelist.
 
-          # 1c) SafeNav is deliberately offline. Organic Maps still queries
-          # ConnectivityManager during native initialization. Without
-          # ACCESS_NETWORK_STATE Android throws SecurityException before the map UI starts.
-          # Patch ConnectionState so SafeNav always reports "no network" and never calls
-          # ConnectivityManager.
-          cs = root / "android/sdk/src/main/java/app/organicmaps/sdk/util/ConnectionState.java"
-          if not cs.exists():
-              candidates = list(root.glob("android/**/ConnectionState.java"))
-              if not candidates:
-                  raise SystemExit("ConnectionState.java not found")
-              cs = candidates[0]
-          cst = cs.read_text(encoding="utf-8")
-          cst = re.sub(
-              r'public\s+static\s+boolean\s+isNetworkConnected\s*\(\s*\)\s*\{.*?\n\s*\}',
-              'public static boolean isNetworkConnected() { return false; }',
-              cst, count=1, flags=re.S
-          )
-          cst = re.sub(
-              r'public\s+static\s+int\s+getConnectionState\s*\(\s*\)\s*\{.*?\n\s*\}',
-              'public static int getConnectionState() { return CONNECTION_NONE; }',
-              cst, count=1, flags=re.S
-          )
-          # requestCurrentType is the path shown by the Xiaomi crash stack.
-          cst = re.sub(
-              r'(?:public|private)\s+static\s+[^\s]+\s+requestCurrentType\s*\(\s*\)\s*\{.*?\n\s*\}',
-              'private static int requestCurrentType() { return CONNECTION_NONE; }',
-              cst, count=1, flags=re.S
-          )
-          cs.write_text(cst, encoding="utf-8")
+          # 1c) Keep upstream ConnectionState so online map downloads work.
 
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
           s = gradle.read_text(encoding="utf-8")
-          # Organic Maps' own APK permission verifier treats network permissions as mandatory.
-          # SafeNav intentionally removes them, so remove the same two entries from its whitelist.
-          s = s.replace("    \"name='android.permission.INTERNET'\",\n", "")
-          s = s.replace("    \"name='android.permission.ACCESS_NETWORK_STATE'\",\n", "")
           marker = "defaultConfig {"
           p = s.find(marker)
           if p < 0:
@@ -145,18 +81,9 @@ jobs:
           # No native LocalCountryFile injection in this build.
           PY
 
-      - name: Bundle Kyiv Oblast map
+      - name: Prepare hybrid map build
         run: |
-          cd om
-          mkdir -p android/app/src/fdroid/assets
-          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
-          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
-          VERSION=$(python3 -c 'import json; print(json.load(open("data/countries.json"))["v"])')
-          SIZE=$(python3 -c 'import json; d=json.load(open("data/countries.json")); u=next(x for x in d["g"] if x["id"]=="Ukraine"); print(next(x["s"] for x in u["g"] if x["id"]=="Ukraine_Kyiv Oblast"))')
-          curl -fL --retry 3 -o "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm" "https://cdn.organicmaps.app/maps/$VERSION/Ukraine_Kyiv%20Oblast.mwm"
-          test "$(stat -c%s "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm")" = "$SIZE"
-          du -sh android/app/src/fdroid/assets
-
+          echo "Online map downloads enabled; navigation/routing remains local after maps are downloaded."
       - name: Build arm64 APK
         working-directory: om/android
         env:
@@ -168,10 +95,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-Kyiv-v0.3.2.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.4.0.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.2.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.4.0.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -182,32 +109,29 @@ jobs:
             exit 1
           fi
 
-          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.3.2.apk | grep -c 'assets/.*\.mwm')"
-          echo "Bundled MWM count: $COUNT"
-          test "$COUNT" -ge 3
-          sha256sum SafeNav-Offline-Kyiv-v0.3.2.apk | tee SafeNav-Offline-Kyiv-v0.3.2.sha256
-          ls -lh SafeNav-Offline-Kyiv-v0.3.2.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.4.0.apk | tee SafeNav-Offline-Kyiv-v0.4.0.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.4.0.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-kyiv-v0.3.2 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-kyiv-v0.3.2 \
-            SafeNav-Offline-Kyiv-v0.3.2.apk \
-            SafeNav-Offline-Kyiv-v0.3.2.sha256 \
+          gh release delete safenav-offline-kyiv-v0.4.0 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.4.0 \
+            SafeNav-Offline-Kyiv-v0.4.0.apk \
+            SafeNav-Offline-Kyiv-v0.4.0.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline Kyiv v0.3.2" \
-            --notes "Stable SafeNav launcher build. Unsupported direct MWM asset injection was removed after on-device Xiaomi crash testing. INTERNET and ACCESS_NETWORK_STATE permissions remain absent."
+            --title "SafeNav Offline Kyiv v0.4.0" \
+            --notes "Hybrid SafeNav: maps are downloaded online on demand; routing/navigation uses downloaded local map data. This keeps the APK small enough for direct chat delivery."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-Kyiv-v0.3.2
+          name: SafeNav-Offline-Kyiv-v0.4.0
           path: |
-            SafeNav-Offline-Kyiv-v0.3.2.apk
-            SafeNav-Offline-Kyiv-v0.3.2.sha256
+            SafeNav-Offline-Kyiv-v0.4.0.apk
+            SafeNav-Offline-Kyiv-v0.4.0.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
