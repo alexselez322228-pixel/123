@@ -40,7 +40,7 @@ public final class NavMapView extends View {
         });
     }
     public void setLongPressListener(LongPressListener l){lp=l;}
-    public void setGraph(RoadGraph graph){g=graph;base=g.render(2048);centerOn(curLat,curLon);invalidate();}
+    public void setGraph(RoadGraph graph){g=graph;base=g.render(4096);centerOn(curLat,curLon);invalidate();}
     public void setRoute(int[] r){route=r==null?new int[0]:r;invalidate();}
     public void setPosition(double lat,double lon,boolean center){curLat=lat;curLon=lon;if(center)centerOn(lat,lon);invalidate();}
 
