@@ -1,4 +1,4 @@
-name: Build NavShlyah UA Native v1.0
+name: Build NavShlyah UA Native v1.1
 
 on:
   push:
@@ -65,16 +65,16 @@ jobs:
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "INTERNET permission found"; exit 1
           fi
-          cp "$APK" NavShlyah-UA-Native-v1.0.apk
-          sha256sum NavShlyah-UA-Native-v1.0.apk | tee NavShlyah-UA-Native-v1.0.sha256
-          ls -lh NavShlyah-UA-Native-v1.0.apk
+          cp "$APK" NavShlyah-UA-Native-v1.1.apk
+          sha256sum NavShlyah-UA-Native-v1.1.apk | tee NavShlyah-UA-Native-v1.1.sha256
+          ls -lh NavShlyah-UA-Native-v1.1.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NavShlyah-UA-Native-v1.0
+          name: NavShlyah-UA-Native-v1.1
           path: |
-            NavShlyah-UA-Native-v1.0.apk
-            NavShlyah-UA-Native-v1.0.sha256
+            NavShlyah-UA-Native-v1.1.apk
+            NavShlyah-UA-Native-v1.1.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
