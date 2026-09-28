@@ -53,7 +53,7 @@ jobs:
               ms = mf.read_text(encoding="utf-8")
               original = ms
               ms = re.sub(
-                  r'\\s*<uses-permission\\s+android:name="android.permission.INTERNET"(?:\\s+[^>]*)?/?>\\s*',
+                  r'\s*<uses-permission\s+android:name="android.permission.INTERNET"(?:\s+[^>]*)?/?>\s*',
                   '\\n', ms
               )
               if mf == root / "android/app/src/main/AndroidManifest.xml":
@@ -63,7 +63,7 @@ jobs:
                   # ACCESS_NETWORK_STATE required by Organic Maps ConnectionState.
                   removal_node = '\\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\\n'
                   access_node = '  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\\n'
-                  ms, n = re.subn(r'(<manifest\\b[^>]*>)', r'\\1' + removal_node + access_node, ms, count=1, flags=re.S)
+                  ms, n = re.subn(r'(<manifest\b[^>]*>)', r'\\1' + removal_node + access_node, ms, count=1, flags=re.S)
                   if n != 1:
                       raise SystemExit("Could not locate opening <manifest> tag")
               if ms != original:
