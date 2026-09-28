@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Ukraine Final Main
+name: Build SafeNav Offline Kyiv v0.3.2
 
 on:
   push:
@@ -46,29 +46,24 @@ jobs:
 
           root = Path("om")
 
-          # 1) Strong offline/privacy manifests: remove network capability from every module
-          # before Android Manifest Merger runs.
+          # 1) SafeNav remains offline, but Organic Maps SDK requires ACCESS_NETWORK_STATE
+          # during native platform initialization. Keep INTERNET removed, while allowing
+          # the non-networking connectivity-state permission.
           for mf in root.glob("android/**/AndroidManifest.xml"):
               ms = mf.read_text(encoding="utf-8")
               original = ms
-              for perm in (
-                  "android.permission.INTERNET",
-                  "android.permission.ACCESS_NETWORK_STATE",
-              ):
-                  ms = re.sub(
-                      r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"(?:\s+[^>]*)?/?>\s*',
-                      '\n',
-                      ms
-                  )
+              ms = re.sub(
+                  r'\\s*<uses-permission\\s+android:name="android.permission.INTERNET"(?:\\s+[^>]*)?/?>\\s*',
+                  '\\n', ms
+              )
               if mf == root / "android/app/src/main/AndroidManifest.xml":
                   ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
                   ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
-                  # Force Manifest Merger to reject network permissions supplied by external AARs.
-                  removal_nodes = (
-                      '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>'
-                      '\n  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove"/>\n'
-                  )
-                  ms, n = re.subn(r'(<manifest\b[^>]*>)', r'\\1' + removal_nodes, ms, count=1, flags=re.S)
+                  # Reject INTERNET from merged dependencies, but explicitly retain
+                  # ACCESS_NETWORK_STATE required by Organic Maps ConnectionState.
+                  removal_node = '\\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\\n'
+                  access_node = '  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\\n'
+                  ms, n = re.subn(r'(<manifest\\b[^>]*>)', r'\\1' + removal_node + access_node, ms, count=1, flags=re.S)
                   if n != 1:
                       raise SystemExit("Could not locate opening <manifest> tag")
               if ms != original:
@@ -251,34 +246,34 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-UA-v0.2.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.3.2.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-UA-v0.2.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.2.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
             exit 1
           fi
-          if grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
-            echo "ERROR: ACCESS_NETWORK_STATE permission found"
+          if ! grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE permission missing (required by Organic Maps SDK)"
             exit 1
           fi
 
-          COUNT="$(unzip -l SafeNav-Offline-UA-v0.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.3.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
           echo "Bundled MWM count: $COUNT"
           test "$COUNT" -ge 27
 
-          sha256sum SafeNav-Offline-UA-v0.2.apk | tee SafeNav-Offline-UA-v0.2.sha256
-          ls -lh SafeNav-Offline-UA-v0.2.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.3.2.apk | tee SafeNav-Offline-Kyiv-v0.3.2.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.3.2.apk
           df -h
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-UA-v0.2
+          name: SafeNav-Offline-Kyiv-v0.3.2
           path: |
-            SafeNav-Offline-UA-v0.2.apk
-            SafeNav-Offline-UA-v0.2.sha256
+            SafeNav-Offline-Kyiv-v0.3.2.apk
+            SafeNav-Offline-Kyiv-v0.3.2.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
