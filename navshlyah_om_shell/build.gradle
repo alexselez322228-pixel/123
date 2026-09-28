@@ -17,8 +17,13 @@ android {
       signingConfig signingConfigs.debug
     }
   }
+
+  compileOptions {
+    coreLibraryDesugaringEnabled = true
+  }
 }
 
 dependencies {
   implementation project(':sdk')
+  coreLibraryDesugaring libs.android.tools.desugaring
 }
