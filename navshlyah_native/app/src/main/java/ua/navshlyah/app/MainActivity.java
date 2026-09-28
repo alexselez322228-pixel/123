@@ -65,6 +65,17 @@ public final class MainActivity extends Activity implements LocationListener {
 
         root.addView(bar);
         root.addView(status);
+
+        LinearLayout zoomBar=new LinearLayout(this);
+        zoomBar.setOrientation(LinearLayout.HORIZONTAL);
+        zoomBar.setGravity(Gravity.END);
+        zoomBar.setPadding(dp(8),0,dp(8),dp(4));
+        Button zoomOut=new Button(this); zoomOut.setText("−"); zoomOut.setTextSize(22); zoomOut.setOnClickListener(v->map.zoomBy(0.75f));
+        Button zoomIn=new Button(this); zoomIn.setText("+"); zoomIn.setTextSize(22); zoomIn.setOnClickListener(v->map.zoomBy(1.35f));
+        zoomBar.addView(zoomOut,new LinearLayout.LayoutParams(dp(64),dp(48)));
+        zoomBar.addView(zoomIn,new LinearLayout.LayoutParams(dp(64),dp(48)));
+        root.addView(zoomBar);
+
         root.addView(map,new LinearLayout.LayoutParams(-1,0,1));
         root.addView(hint);
         setContentView(root);
