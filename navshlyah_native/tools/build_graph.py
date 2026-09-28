@@ -28,6 +28,9 @@ def dist(a,b):
 
 with src.open("r", encoding="utf-8") as f:
     for line in f:
+        line=line.lstrip("\x1e").strip()
+        if not line:
+            continue
         try: g=json.loads(line)
         except: continue
         if g.get("type")!="Feature": continue
@@ -58,3 +61,5 @@ with out.open("wb") as f:
     for a,b,w in edges:
         f.write(struct.pack("<IIH",a,b,w))
 print("nodes",len(coords),"edges",len(edges),"bytes",out.stat().st_size)
+if len(coords) < 1000 or len(edges) < 1000:
+    raise SystemExit("Road graph unexpectedly empty/small")
