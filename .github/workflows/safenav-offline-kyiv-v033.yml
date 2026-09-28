@@ -1,0 +1,169 @@
+name: Build SafeNav Offline Kyiv v0.3.3 working
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/safenav-offline-kyiv-v033.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk/* /opt/ghc /usr/local/share/boost || true
+          docker system prune -af || true
+          df -h
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build ccache curl unzip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;29.0.14206865"
+
+      - name: Fetch Organic Maps source
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/organicmaps/organicmaps.git om
+          cd om
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/29.0.14206865" >> android/local.properties
+
+      - name: Patch SafeNav offline permissions and branding
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          root = Path("om")
+
+          # SafeNav must have no INTERNET capability, but Organic Maps' startup code
+          # legitimately queries ConnectivityManager. Keep ACCESS_NETWORK_STATE.
+          for mf in root.glob("android/**/AndroidManifest.xml"):
+              ms = mf.read_text(encoding="utf-8")
+              original = ms
+              ms = re.sub(
+                  r'\s*<uses-permission\s+android:name="android.permission.INTERNET"(?:\s+[^>]*)?/?>\s*',
+                  '\n',
+                  ms
+              )
+              if mf == root / "android/app/src/main/AndroidManifest.xml":
+                  ms = ms.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+                  ms = ms.replace('android:backupInForeground="true"', 'android:backupInForeground="false"')
+
+                  # Prevent dependencies from re-introducing INTERNET.
+                  m = re.search(r'<manifest\b[^>]*>', ms, flags=re.S)
+                  if not m:
+                      raise SystemExit("Could not locate opening <manifest> tag")
+                  removal_node = '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n'
+                  ms = ms[:m.end()] + removal_node + ms[m.end():]
+
+              if ms != original:
+                  mf.write_text(ms, encoding="utf-8")
+
+          main_manifest = root / "android/app/src/main/AndroidManifest.xml"
+          ET.parse(main_manifest)
+          main_text = main_manifest.read_text(encoding="utf-8")
+          if 'android.permission.ACCESS_NETWORK_STATE' not in main_text:
+              raise SystemExit("ACCESS_NETWORK_STATE missing from Organic Maps manifest")
+
+          # Organic Maps' APK verifier normally requires INTERNET. SafeNav intentionally
+          # removes only INTERNET, so update the expected permission set accordingly.
+          gradle = root / "android/app/build.gradle"
+          s = gradle.read_text(encoding="utf-8")
+          s = s.replace("    \"name='android.permission.INTERNET'\",\n", "")
+
+          marker = "defaultConfig {"
+          p = s.find(marker)
+          if p < 0:
+              raise SystemExit("defaultConfig not found")
+          insert_at = p + len(marker)
+          s = s[:insert_at] + "\n    applicationId 'app.safenav.offline'\n" + s[insert_at:]
+          gradle.write_text(s, encoding="utf-8")
+
+          # Visible app name.
+          for path in root.glob("android/app/src/main/res/values*/strings.xml"):
+              txt = path.read_text(encoding="utf-8")
+              txt2 = re.sub(
+                  r'(<string\s+name="app_name"[^>]*>).*?(</string>)',
+                  r'\1SafeNav Offline Kyiv\2',
+                  txt,
+                  count=1,
+                  flags=re.S
+              )
+              if txt2 != txt:
+                  path.write_text(txt2, encoding="utf-8")
+          PY
+
+      - name: Bundle Kyiv and Kyiv Oblast map
+        run: |
+          cd om
+          mkdir -p android/app/src/fdroid/assets
+          cp data/World.mwm android/app/src/fdroid/assets/World.mwm
+          cp data/WorldCoasts.mwm android/app/src/fdroid/assets/WorldCoasts.mwm
+
+          VERSION=$(python3 -c 'import json; print(json.load(open("data/countries.json"))["v"])')
+          SIZE=$(python3 -c 'import json; d=json.load(open("data/countries.json")); u=next(x for x in d["g"] if x["id"]=="Ukraine"); print(next(x["s"] for x in u["g"] if x["id"]=="Ukraine_Kyiv Oblast"))')
+
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+            -o "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm" \
+            "https://cdn.organicmaps.app/maps/$VERSION/Ukraine_Kyiv%20Oblast.mwm"
+
+          test "$(stat -c%s "android/app/src/fdroid/assets/Ukraine_Kyiv Oblast.mwm")" = "$SIZE"
+          du -sh android/app/src/fdroid/assets
+
+      - name: Build arm64 APK
+        working-directory: om/android
+        env:
+          CI: "true"
+        run: |
+          ./gradlew --no-daemon --stacktrace -Parm64 -Pnjobs=2 -Pfirebase=false :app:assembleFdroidProfileable
+
+      - name: Collect and verify APK
+        run: |
+          APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
+          test -n "$APK"
+          cp "$APK" SafeNav-Offline-Kyiv-v0.3.3.apk
+
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.3.apk | tee permissions.txt
+
+          if grep -q "android.permission.INTERNET" permissions.txt; then
+            echo "ERROR: INTERNET permission found"
+            exit 1
+          fi
+          if ! grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE permission missing"
+            exit 1
+          fi
+
+          COUNT="$(unzip -l SafeNav-Offline-Kyiv-v0.3.3.apk | grep -c 'assets/.*\.mwm')"
+          echo "Bundled MWM count: $COUNT"
+          test "$COUNT" -ge 3
+
+          sha256sum SafeNav-Offline-Kyiv-v0.3.3.apk | tee SafeNav-Offline-Kyiv-v0.3.3.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.3.3.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SafeNav-Offline-Kyiv-v0.3.3
+          path: |
+            SafeNav-Offline-Kyiv-v0.3.3.apk
+            SafeNav-Offline-Kyiv-v0.3.3.sha256
+            permissions.txt
+          compression-level: 0
+          if-no-files-found: error
