@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.2 manifest-fix
+name: Build SafeNav Offline Kyiv v0.3.2 final-fix
 
 on:
   push:
@@ -68,8 +68,7 @@ jobs:
                   if not m:
                       raise SystemExit("Could not locate opening <manifest> tag")
                   removal_node = '\n  <uses-permission android:name="android.permission.INTERNET" tools:node="remove"/>\n'
-                  access_node = '  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n'
-                  ms = ms[:m.end()] + removal_node + access_node + ms[m.end():]
+                  ms = ms[:m.end()] + removal_node + ms[m.end():]
 
               if ms != original:
                   mf.write_text(ms, encoding="utf-8")
@@ -87,6 +86,10 @@ jobs:
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
           s = gradle.read_text(encoding="utf-8")
+          # Organic Maps' permission checker expects INTERNET by default. SafeNav
+          # deliberately removes INTERNET, so remove only that permission from
+          # the expected whitelist while retaining ACCESS_NETWORK_STATE.
+          s = s.replace("    \"name='android.permission.INTERNET'\",\n", "")
           marker = "defaultConfig {"
           p = s.find(marker)
           if p < 0:
