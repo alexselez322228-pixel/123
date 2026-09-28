@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.2
+name: Build SafeNav Offline Kyiv v0.3.2 fixed
 
 on:
   push:
