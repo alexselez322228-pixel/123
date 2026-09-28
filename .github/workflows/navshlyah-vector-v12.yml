@@ -1,0 +1,101 @@
+name: Build NavShlyah UA Vector v1.2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'navshlyah_om_shell/**'
+      - '.github/workflows/navshlyah-vector-v12.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          docker system prune -af || true
+          df -h
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android/NDK prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build ccache curl unzip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"             "platforms;android-36"             "build-tools;36.0.0"             "cmake;3.22.1"             "ndk;29.0.14206865"
+
+      - name: Fetch Organic Maps SDK source
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/organicmaps/organicmaps.git om
+          cd om
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "ndk.dir=$ANDROID_HOME/ndk/29.0.14206865" >> android/local.properties
+
+      - name: Create NavShlyah app shell
+        run: |
+          python3 navshlyah_om_shell/patch.py
+
+      - name: Bundle Kyiv and Kyiv Oblast vector map
+        run: |
+          mkdir -p om/android/navshlyah/src/main/assets
+          cp om/data/World.mwm om/android/navshlyah/src/main/assets/World.mwm
+          cp om/data/WorldCoasts.mwm om/android/navshlyah/src/main/assets/WorldCoasts.mwm
+
+          VERSION=$(python3 -c 'import json; print(json.load(open("om/data/countries.json"))["v"])')
+          SIZE=$(python3 -c 'import json; d=json.load(open("om/data/countries.json")); u=next(x for x in d["g"] if x["id"]=="Ukraine"); print(next(x["s"] for x in u["g"] if x["id"]=="Ukraine_Kyiv Oblast"))')
+
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 20             -o "om/android/navshlyah/src/main/assets/Ukraine_Kyiv Oblast.mwm"             "https://cdn.organicmaps.app/maps/$VERSION/Ukraine_Kyiv%20Oblast.mwm"
+
+          test "$(stat -c%s "om/android/navshlyah/src/main/assets/Ukraine_Kyiv Oblast.mwm")" = "$SIZE"
+          du -sh om/android/navshlyah/src/main/assets
+
+      - name: Build NavShlyah APK
+        working-directory: om/android
+        env:
+          CI: "true"
+        run: |
+          ./gradlew --no-daemon --stacktrace -Parm64 -Pnjobs=2 :navshlyah:assembleRelease
+
+      - name: Verify APK
+        run: |
+          APK="$(find om/android/navshlyah/build/outputs/apk -type f -name '*.apk' | head -1)"
+          test -n "$APK"
+          cp "$APK" NavShlyah-UA-Vector-v1.2.apk
+
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          "$AAPT" dump permissions NavShlyah-UA-Vector-v1.2.apk | tee permissions.txt
+          if grep -q "android.permission.INTERNET" permissions.txt; then
+            echo "ERROR: INTERNET permission found"
+            exit 1
+          fi
+          if ! grep -q "android.permission.ACCESS_NETWORK_STATE" permissions.txt; then
+            echo "ERROR: ACCESS_NETWORK_STATE missing"
+            exit 1
+          fi
+
+          COUNT="$(unzip -l NavShlyah-UA-Vector-v1.2.apk | awk '/assets\/.*\.mwm$/ {c++} END{print c+0}')"
+          echo "Bundled MWM count: $COUNT"
+          test "$COUNT" -ge 3
+
+          sha256sum NavShlyah-UA-Vector-v1.2.apk | tee NavShlyah-UA-Vector-v1.2.sha256
+          ls -lh NavShlyah-UA-Vector-v1.2.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NavShlyah-UA-Vector-v1.2
+          path: |
+            NavShlyah-UA-Vector-v1.2.apk
+            NavShlyah-UA-Vector-v1.2.sha256
+            permissions.txt
+          compression-level: 0
+          if-no-files-found: error
