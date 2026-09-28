@@ -13,6 +13,7 @@ public final class RoadGraph {
     public int n, m;
     public int[] latE6, lonE6, from, to;
     public short[] weight;
+    public byte[] roadClass;
     public int[] head, next;
     public double minLat=90,maxLat=-90,minLon=180,maxLon=-180;
 
@@ -20,7 +21,9 @@ public final class RoadGraph {
         RoadGraph g=new RoadGraph();
         try(DataInputStream in=new DataInputStream(new BufferedInputStream(ctx.getAssets().open("roads.bin")))){
             byte[] magic=new byte[4]; in.readFully(magic);
-            if(!Arrays.equals(magic,new byte[]{'N','S','G','1'})) throw new IOException("bad graph");
+            boolean v2=Arrays.equals(magic,new byte[]{'N','S','G','2'});
+            boolean v1=Arrays.equals(magic,new byte[]{'N','S','G','1'});
+            if(!v1 && !v2) throw new IOException("bad graph");
             g.n=Integer.reverseBytes(in.readInt());
             g.m=Integer.reverseBytes(in.readInt());
             g.latE6=new int[g.n]; g.lonE6=new int[g.n];
@@ -31,14 +34,14 @@ public final class RoadGraph {
                 g.minLat=Math.min(g.minLat,la); g.maxLat=Math.max(g.maxLat,la);
                 g.minLon=Math.min(g.minLon,lo); g.maxLon=Math.max(g.maxLon,lo);
             }
-            g.from=new int[g.m]; g.to=new int[g.m]; g.weight=new short[g.m];
+            g.from=new int[g.m]; g.to=new int[g.m]; g.weight=new short[g.m]; g.roadClass=new byte[g.m];
             g.head=new int[g.n]; Arrays.fill(g.head,-1); g.next=new int[g.m];
             for(int i=0;i<g.m;i++){
                 int a=Integer.reverseBytes(in.readInt());
                 int b=Integer.reverseBytes(in.readInt());
                 int lo=in.readUnsignedByte(), hi=in.readUnsignedByte();
                 int w=lo|(hi<<8);
-                g.from[i]=a; g.to[i]=b; g.weight[i]=(short)w;
+                g.from[i]=a; g.to[i]=b; g.weight[i]=(short)w; g.roadClass[i]=(byte)(v2?in.readUnsignedByte():7);
                 g.next[i]=g.head[a]; g.head[a]=i;
             }
         }
@@ -101,15 +104,28 @@ public final class RoadGraph {
 
     public Bitmap render(int size){
         Bitmap bmp=Bitmap.createBitmap(size,size,Bitmap.Config.RGB_565);
-        Canvas c=new Canvas(bmp); c.drawColor(Color.rgb(247,247,244));
-        Paint p=new Paint(Paint.ANTI_ALIAS_FLAG); p.setColor(Color.rgb(185,185,180)); p.setStrokeWidth(1.2f);
-        for(int e=0;e<m;e++){
-            int a=from[e],b=to[e];
-            float x1=(float)((lon(a)-minLon)/(maxLon-minLon)*size);
-            float y1=(float)((maxLat-lat(a))/(maxLat-minLat)*size);
-            float x2=(float)((lon(b)-minLon)/(maxLon-minLon)*size);
-            float y2=(float)((maxLat-lat(b))/(maxLat-minLat)*size);
-            c.drawLine(x1,y1,x2,y2,p);
+        Canvas c=new Canvas(bmp); c.drawColor(Color.rgb(242,244,239));
+        Paint p=new Paint(Paint.ANTI_ALIAS_FLAG); p.setStrokeCap(Paint.Cap.ROUND);
+        for(int cls=7;cls>=0;cls--){
+            switch(cls){
+                case 0: p.setColor(Color.rgb(232,154,75)); p.setStrokeWidth(5.4f); break;
+                case 1: p.setColor(Color.rgb(238,177,95)); p.setStrokeWidth(4.8f); break;
+                case 2: p.setColor(Color.rgb(244,202,116)); p.setStrokeWidth(4.0f); break;
+                case 3: p.setColor(Color.rgb(247,221,150)); p.setStrokeWidth(3.2f); break;
+                case 4: p.setColor(Color.rgb(213,209,193)); p.setStrokeWidth(2.4f); break;
+                case 5: p.setColor(Color.rgb(202,202,196)); p.setStrokeWidth(1.7f); break;
+                case 6: p.setColor(Color.rgb(211,211,205)); p.setStrokeWidth(1.4f); break;
+                default:p.setColor(Color.rgb(219,219,214)); p.setStrokeWidth(1.0f); break;
+            }
+            for(int e=0;e<m;e++){
+                if(Byte.toUnsignedInt(roadClass[e])!=cls) continue;
+                int a=from[e],b=to[e];
+                float x1=(float)((lon(a)-minLon)/(maxLon-minLon)*size);
+                float y1=(float)((maxLat-lat(a))/(maxLat-minLat)*size);
+                float x2=(float)((lon(b)-minLon)/(maxLon-minLon)*size);
+                float y2=(float)((maxLat-lat(b))/(maxLat-minLat)*size);
+                c.drawLine(x1,y1,x2,y2,p);
+            }
         }
         return bmp;
     }
