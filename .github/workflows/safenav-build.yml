@@ -1,4 +1,4 @@
-name: Build SafeNav Offline Kyiv v0.3.0 stable
+name: Build SafeNav Offline Kyiv v0.3.1 stable
 
 on:
   push:
@@ -83,6 +83,36 @@ jobs:
           ag = ag.replace('    "name=\'android.permission.ACCESS_NETWORK_STATE\'",\n', '')
           app_gradle.write_text(ag, encoding="utf-8")
 
+          # 1c) SafeNav is deliberately offline. Organic Maps still queries
+          # ConnectivityManager during native initialization. Without
+          # ACCESS_NETWORK_STATE Android throws SecurityException before the map UI starts.
+          # Patch ConnectionState so SafeNav always reports "no network" and never calls
+          # ConnectivityManager.
+          cs = root / "android/sdk/src/main/java/app/organicmaps/sdk/util/ConnectionState.java"
+          if not cs.exists():
+              candidates = list(root.glob("android/**/ConnectionState.java"))
+              if not candidates:
+                  raise SystemExit("ConnectionState.java not found")
+              cs = candidates[0]
+          cst = cs.read_text(encoding="utf-8")
+          cst = re.sub(
+              r'public\s+static\s+boolean\s+isNetworkConnected\s*\(\s*\)\s*\{.*?\n\s*\}',
+              'public static boolean isNetworkConnected() { return false; }',
+              cst, count=1, flags=re.S
+          )
+          cst = re.sub(
+              r'public\s+static\s+int\s+getConnectionState\s*\(\s*\)\s*\{.*?\n\s*\}',
+              'public static int getConnectionState() { return CONNECTION_NONE; }',
+              cst, count=1, flags=re.S
+          )
+          # requestCurrentType is the path shown by the Xiaomi crash stack.
+          cst = re.sub(
+              r'(?:public|private)\s+static\s+[^\s]+\s+requestCurrentType\s*\(\s*\)\s*\{.*?\n\s*\}',
+              'private static int requestCurrentType() { return CONNECTION_NONE; }',
+              cst, count=1, flags=re.S
+          )
+          cs.write_text(cst, encoding="utf-8")
+
           # 2) Give the sideload build its own application id.
           gradle = root / "android/app/build.gradle"
           s = gradle.read_text(encoding="utf-8")
@@ -134,10 +164,10 @@ jobs:
         run: |
           APK="$(find om/android/app/build/outputs/apk -type f -name '*.apk' | grep -i 'fdroid' | grep -i 'profileable' | head -1)"
           test -n "$APK"
-          cp "$APK" SafeNav-Offline-Kyiv-v0.3.0.apk
+          cp "$APK" SafeNav-Offline-Kyiv-v0.3.1.apk
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.0.apk | tee permissions.txt
+          "$AAPT" dump permissions SafeNav-Offline-Kyiv-v0.3.1.apk | tee permissions.txt
 
           if grep -q "android.permission.INTERNET" permissions.txt; then
             echo "ERROR: INTERNET permission found"
@@ -148,29 +178,29 @@ jobs:
             exit 1
           fi
 
-          sha256sum SafeNav-Offline-Kyiv-v0.3.0.apk | tee SafeNav-Offline-Kyiv-v0.3.0.sha256
-          ls -lh SafeNav-Offline-Kyiv-v0.3.0.apk
+          sha256sum SafeNav-Offline-Kyiv-v0.3.1.apk | tee SafeNav-Offline-Kyiv-v0.3.1.sha256
+          ls -lh SafeNav-Offline-Kyiv-v0.3.1.apk
           df -h
 
       - name: Publish public APK download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete safenav-offline-kyiv-v0.3.0 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create safenav-offline-kyiv-v0.3.0 \
-            SafeNav-Offline-Kyiv-v0.3.0.apk \
-            SafeNav-Offline-Kyiv-v0.3.0.sha256 \
+          gh release delete safenav-offline-kyiv-v0.3.1 --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create safenav-offline-kyiv-v0.3.1 \
+            SafeNav-Offline-Kyiv-v0.3.1.apk \
+            SafeNav-Offline-Kyiv-v0.3.1.sha256 \
             permissions.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --title "SafeNav Offline Kyiv v0.3.0" \
+            --title "SafeNav Offline Kyiv v0.3.1" \
             --notes "Stable SafeNav launcher build. Unsupported direct MWM asset injection was removed after on-device Xiaomi crash testing. INTERNET and ACCESS_NETWORK_STATE permissions remain absent."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SafeNav-Offline-Kyiv-v0.3.0
+          name: SafeNav-Offline-Kyiv-v0.3.1
           path: |
-            SafeNav-Offline-Kyiv-v0.3.0.apk
-            SafeNav-Offline-Kyiv-v0.3.0.sha256
+            SafeNav-Offline-Kyiv-v0.3.1.apk
+            SafeNav-Offline-Kyiv-v0.3.1.sha256
             permissions.txt
           compression-level: 0
           if-no-files-found: error
