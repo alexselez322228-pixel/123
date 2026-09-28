@@ -7,8 +7,8 @@ android {
 
   defaultConfig {
     applicationId 'ua.navshlyah.app'
-    versionCode 12
-    versionName '1.2.0'
+    versionCode 13
+    versionName '1.3.0'
   }
 
   buildTypes {
@@ -16,6 +16,13 @@ android {
       minifyEnabled false
       signingConfig signingConfigs.debug
     }
+  }
+
+  androidResources {
+    ignoreAssetsPattern = '!.svn:!.git:!.DS_Store:!*.scc:.*:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~'
+    // MWM files are random-access vector databases. If compressed in the APK,
+    // startup can stall while Android inflates ~100+ MB. Keep them stored.
+    noCompress = ['png', 'mwm', 'ttf', 'packed_polygons.bin']
   }
 
   compileOptions {
