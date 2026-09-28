@@ -15,13 +15,15 @@ import app.organicmaps.sdk.Framework;
 import app.organicmaps.sdk.Map;
 import app.organicmaps.sdk.MapView;
 import app.organicmaps.sdk.OrganicMaps;
+import app.organicmaps.sdk.PlacePageActivationListener;
+import app.organicmaps.sdk.widget.placepage.PlacePageData;
 import app.organicmaps.sdk.Router;
 import app.organicmaps.sdk.bookmarks.data.MapObject;
 import app.organicmaps.sdk.routing.CarDirection;
 import app.organicmaps.sdk.routing.RoutingController;
 import app.organicmaps.sdk.routing.RoutingInfo;
 
-public final class MainActivity extends Activity implements RoutingController.Container {
+public final class MainActivity extends Activity implements RoutingController.Container, PlacePageActivationListener {
   private static final int REQ=7;
 
   private OrganicMaps om;
@@ -75,7 +77,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
     top.addView(plus,new LinearLayout.LayoutParams(dp(58),dp(48)));
 
     status=new TextView(this);
-    status.setText("Офлайн-карта готова. GPS потрібен лише для початкової точки.");
+    status.setText("Офлайн-карта готова. Торкніться місця на карті або введіть координати.");
     status.setTextColor(Color.DKGRAY);
     status.setTextSize(14);
     status.setPadding(dp(12),dp(6),dp(12),dp(6));
@@ -104,7 +106,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
     navMain.setTypeface(null,1);
 
     navSub=new TextView(this);
-    navSub.setText("Щосекундне ведення буде активне після запуску маршруту.");
+    navSub.setText("Торкніться точки на карті — маршрут побудується автоматично.");
     navSub.setTextSize(14);
     navSub.setTextColor(Color.DKGRAY);
 
@@ -123,7 +125,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
     mapView.getMap().setLocationHelper(om.getLocationHelper());
 
     Button gps=new Button(this);
-    gps.setText("Разово уточнити старт GPS");
+    gps.setText("Разово уточнити GPS");
     gps.setOnClickListener(v->requestStartFix());
 
     root.addView(top);
@@ -146,37 +148,45 @@ public final class MainActivity extends Activity implements RoutingController.Co
       return;
     }
     status.setText("Разово визначаю стартову точку GPS… після фіксації GNSS вимикається.");
-    try { om.getLocationHelper().start(); }
+    try { om.getLocationHelper().requestOneShotGpsFix(); }
     catch(Exception e){ status.setText("Не вдалося запустити GPS: "+e.getMessage()); }
   }
 
   private void buildRoute(){
-    final MapObject start=om.getLocationHelper().getMyPosition();
-    if(start==null){
-      status.setText("Спочатку потрібна початкова точка. Натисніть «Разово уточнити старт GPS».");
-      return;
-    }
-
     double lat,lon;
     try{
       lat=Double.parseDouble(latBox.getText().toString().trim().replace(',','.'));
       lon=Double.parseDouble(lonBox.getText().toString().trim().replace(',','.'));
     }catch(Exception e){
-      status.setText("Введіть координати пункту призначення: широта та довгота.");
+      status.setText("Введіть координати або просто торкніться пункту призначення на карті.");
       return;
     }
+    buildRouteTo(lat,lon,"Пункт призначення");
+  }
 
+  private void buildRouteTo(double lat,double lon,String title){
+    final MapObject start=om.getLocationHelper().getMyPosition();
+    if(start==null){
+      status.setText("Спочатку потрібна початкова точка. Натисніть «Разово уточнити GPS».");
+      return;
+    }
     if(lat<-90||lat>90||lon<-180||lon>180){
-      status.setText("Некоректні координати пункту призначення.");
+      status.setText("Некоректна точка призначення.");
       return;
     }
 
-    MapObject finish=MapObject.createMapObject(MapObject.POI,"Пункт призначення","",lat,lon);
-    status.setText("Будую повний автомобільний маршрут офлайн…");
-    navMain.setText("Побудова маршруту…");
-    startButton.setEnabled(false);
+    latBox.setText(String.format(Locale.US,"%.6f",lat));
+    lonBox.setText(String.format(Locale.US,"%.6f",lon));
+    String resolved=(title==null||title.isEmpty()) ? Framework.nativeGetAddress(lat,lon) : title;
+    if(resolved==null||resolved.isEmpty()) resolved="Точка на карті";
+    MapObject finish=MapObject.createMapObject(MapObject.POI,resolved,"",lat,lon);
 
+    status.setText("Будую автомобільний маршрут до вибраної точки офлайн…");
+    navMain.setText("Побудова маршруту…");
+    navSub.setText(resolved);
+    startButton.setEnabled(false);
     routing.prepare(start,finish,Router.Vehicle);
+    Framework.nativeDeactivateMapSelectionCircle(false);
   }
 
   private void startNavigation(){
@@ -186,7 +196,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
     lastDirection=CarDirection.NoTurn;
     startButton.setEnabled(false);
     stopButton.setEnabled(true);
-    status.setText("Навігація активна. GNSS не використовується — позиція надходить від локального інерційного трекера.");
+    status.setText("Навігація активна. Камера слідкує за рухом щосекунди; GNSS вимкнений до ручного уточнення.");
     speak("Навігацію розпочато");
   }
 
@@ -201,6 +211,8 @@ public final class MainActivity extends Activity implements RoutingController.Co
 
   private void updateNavigationUi(){
     if(!routing.isNavigating()) return;
+    // Keep the camera locked to the locally estimated position and route.
+    try { Framework.nativeFollowRoute(); } catch(Throwable ignored) {}
     RoutingInfo info;
     try { info=Framework.nativeGetRouteFollowingInfo(); }
     catch(Throwable t){ return; }
@@ -279,6 +291,21 @@ public final class MainActivity extends Activity implements RoutingController.Co
     if(tts!=null) tts.speak(text,TextToSpeech.QUEUE_FLUSH,null,"nav");
   }
 
+  @Override public void onPlacePageActivated(PlacePageData data){
+    if(routing.isNavigating()){
+      status.setText("Навігація триває. Для нового пункту спочатку натисніть СТОП.");
+      return;
+    }
+    if(!(data instanceof MapObject)) return;
+    MapObject point=(MapObject)data;
+    if(point.isMyPosition()) return;
+    String title=point.getTitle();
+    if(title==null||title.isEmpty()) title=point.getAddress();
+    buildRouteTo(point.getLat(),point.getLon(),title);
+  }
+
+  @Override public void onPlacePageDeactivated(){}
+
   @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){
     super.onRequestPermissionsResult(r,p,g);
     if(r==REQ && g.length>0 && g[0]==PackageManager.PERMISSION_GRANTED) requestStartFix();
@@ -304,10 +331,18 @@ public final class MainActivity extends Activity implements RoutingController.Co
   @Override public void onNavigationStarted(){}
   @Override public void onNavigationCancelled(){}
 
-  @Override protected void onStart(){ super.onStart(); mapView.getMap().onStart(); }
+  @Override protected void onStart(){
+    super.onStart();
+    mapView.getMap().onStart();
+    Framework.nativePlacePageActivationListener(this);
+  }
   @Override protected void onResume(){ super.onResume(); mapView.getMap().onResume(); }
   @Override protected void onPause(){ mapView.getMap().onPause(); super.onPause(); }
-  @Override protected void onStop(){ mapView.getMap().onStop(); super.onStop(); }
+  @Override protected void onStop(){
+    try { Framework.nativeRemovePlacePageActivationListener(this); } catch(Throwable ignored) {}
+    mapView.getMap().onStop();
+    super.onStop();
+  }
 
   @Override protected void onDestroy(){
     handler.removeCallbacks(navTick);
