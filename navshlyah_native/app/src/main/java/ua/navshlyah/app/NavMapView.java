@@ -12,6 +12,7 @@ public final class NavMapView extends View {
     private float zoom=1f, offX=0,offY=0,lastX,lastY; private boolean drag=false;
     private final Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
     private final GestureDetector gd;
+    private final ScaleGestureDetector sd;
     private LongPressListener lp;
 
     public NavMapView(Context c){super(c);setBackgroundColor(Color.WHITE);
@@ -22,6 +23,20 @@ public final class NavMapView extends View {
                 double[] ll=screenToLatLon(e.getX(),e.getY()); lp.onPoint(ll[0],ll[1]);
             }
             public boolean onDoubleTap(MotionEvent e){zoom=Math.min(8f,zoom*1.5f);invalidate();return true;}
+        });
+        sd=new ScaleGestureDetector(c,new ScaleGestureDetector.SimpleOnScaleGestureListener(){
+            public boolean onScale(ScaleGestureDetector detector){
+                float old=zoom;
+                float next=Math.max(0.75f,Math.min(14f,zoom*detector.getScaleFactor()));
+                float fx=detector.getFocusX(), fy=detector.getFocusY();
+                if(old!=0f){
+                    offX=fx-(fx-offX)*(next/old);
+                    offY=fy-(fy-offY)*(next/old);
+                }
+                zoom=next;
+                invalidate();
+                return true;
+            }
         });
     }
     public void setLongPressListener(LongPressListener l){lp=l;}
@@ -58,8 +73,22 @@ public final class NavMapView extends View {
         c.restore();
     }
 
+    public void zoomBy(float factor){
+        float old=zoom;
+        float next=Math.max(0.75f,Math.min(14f,zoom*factor));
+        float fx=getWidth()/2f, fy=getHeight()/2f;
+        if(old!=0f){
+            offX=fx-(fx-offX)*(next/old);
+            offY=fy-(fy-offY)*(next/old);
+        }
+        zoom=next;
+        invalidate();
+    }
+
     public boolean onTouchEvent(MotionEvent e){
+        sd.onTouchEvent(e);
         gd.onTouchEvent(e);
+        if(sd.isInProgress()) return true;
         switch(e.getActionMasked()){
             case MotionEvent.ACTION_DOWN:lastX=e.getX();lastY=e.getY();drag=true;return true;
             case MotionEvent.ACTION_MOVE:
