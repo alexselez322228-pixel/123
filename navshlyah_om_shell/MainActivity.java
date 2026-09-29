@@ -39,6 +39,9 @@ public final class MainActivity extends Activity implements RoutingController.Co
 
   private int lastAnnouncedBucket=-1;
   private CarDirection lastDirection=CarDirection.NoTurn;
+  private boolean autoRerouting;
+  private boolean restartAfterReroute;
+  private long lastRerouteMs;
 
   private final Runnable navTick=new Runnable(){
     @Override public void run(){
@@ -217,6 +220,16 @@ public final class MainActivity extends Activity implements RoutingController.Co
   }
 
   private void updateNavigationUi(){
+    if(routing.isNavigating() && !autoRerouting){
+      try {
+        if(om.getLocationHelper().isDeadReckoningOffRoute() &&
+           SystemClock.elapsedRealtime()-lastRerouteMs>5000){
+          rebuildAfterDeviation();
+          return;
+        }
+      } catch(Throwable ignored) {}
+    }
+
     if(!routing.isNavigating()) return;
     // Keep the camera locked to the locally estimated position and route.
     try { Framework.nativeFollowRoute(); } catch(Throwable ignored) {}
@@ -242,6 +255,26 @@ public final class MainActivity extends Activity implements RoutingController.Co
                    String.format(Locale.forLanguageTag("uk")," • %.0f%%",info.completionPercent)+speed);
 
     announceIfNeeded(info);
+  }
+
+  private void rebuildAfterDeviation(){
+    MapObject finish=routing.getEndPoint();
+    Location here=om.getLocationHelper().getSavedLocation();
+    if(finish==null || here==null) return;
+
+    autoRerouting=true;
+    restartAfterReroute=true;
+    lastRerouteMs=SystemClock.elapsedRealtime();
+
+    MapObject start=MapObject.createMapObject(
+        MapObject.MY_POSITION,"","",here.getLatitude(),here.getLongitude());
+
+    status.setText("З'їзд з маршруту — перебудовую маршрут офлайн…");
+    navMain.setText("Перебудова маршруту…");
+    navSub.setText("Нова траєкторія від поточної позиції");
+    startButton.setEnabled(false);
+
+    routing.prepare(start,finish,Router.Vehicle);
   }
 
   private void announceIfNeeded(RoutingInfo info){
@@ -330,7 +363,10 @@ public final class MainActivity extends Activity implements RoutingController.Co
 
   @Override public void onStartRouteBuilding(){
     om.getLocationHelper().setDeadReckoningRoute(null);
-    status.setText("Маршрут обчислюється офлайн…");
+    if(autoRerouting)
+      status.setText("З'їзд з маршруту — перебудовую маршрут офлайн…");
+    else
+      status.setText("Маршрут обчислюється офлайн…");
   }
   @Override public void updateBuildProgress(int progress, Router router){ navMain.setText("Побудова маршруту: "+progress+"%"); }
   @Override public void onBuiltRoute(){
@@ -338,12 +374,28 @@ public final class MainActivity extends Activity implements RoutingController.Co
       JunctionInfo[] routePoints=Framework.nativeGetRouteJunctionPoints(3.0);
       om.getLocationHelper().setDeadReckoningRoute(routePoints);
     } catch(Throwable ignored) {}
+
+    if(restartAfterReroute){
+      restartAfterReroute=false;
+      autoRerouting=false;
+      routing.start();
+      startButton.setEnabled(false);
+      stopButton.setEnabled(true);
+      navMain.setText("Маршрут перебудовано");
+      navSub.setText("Продовжуйте рух за новим маршрутом.");
+      status.setText("Новий маршрут побудовано офлайн. Навігація продовжується.");
+      speak("Маршрут перебудовано");
+      return;
+    }
+
     navMain.setText("Маршрут готовий");
     navSub.setText("Натисніть СТАРТ для щосекундного ведення.");
     startButton.setEnabled(true);
     status.setText("Маршрут побудовано локально, без Інтернету.");
   }
   @Override public void onCommonBuildError(int code,String[] maps){
+    autoRerouting=false;
+    restartAfterReroute=false;
     navMain.setText("Помилка маршруту");
     navSub.setText("Код: "+code);
     status.setText("Не вдалося побудувати маршрут. Перевірте, що весь маршрут у межах вбудованої карти.");
