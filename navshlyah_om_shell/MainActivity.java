@@ -232,7 +232,12 @@ public final class MainActivity extends Activity implements RoutingController.Co
     Location estimated=om.getLocationHelper().getSavedLocation();
     String speed="";
     if(estimated!=null && "navshlyah_inertial".equals(estimated.getProvider()))
-      speed=String.format(Locale.forLanguageTag("uk")," • ~%.0f км/год",estimated.getSpeed()*3.6f);
+    {
+      if(estimated.getSpeed()<0.35f)
+        speed=" • СТОЇМО";
+      else
+        speed=String.format(Locale.forLanguageTag("uk")," • ~%.0f км/год",estimated.getSpeed()*3.6f);
+    }
     navSub.setText("До фінішу: "+info.distToTarget.toString(this)+" • "+formatTime(info.totalTimeInSeconds)+street+
                    String.format(Locale.forLanguageTag("uk")," • %.0f%%",info.completionPercent)+speed);
 
