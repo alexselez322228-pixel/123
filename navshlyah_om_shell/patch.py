@@ -46,13 +46,14 @@ hs=helper.read_text(encoding="utf-8")
 # immediately back to DeadReckoningProvider.
 hs=hs.replace(
     "  private boolean mActive;\n  private final Handler mHandler;",
-    "  private boolean mActive;\n  private boolean mNavShlyahOneShotGps;\n  private final Handler mHandler;",
+    "  private boolean mActive;\n  private boolean mNavShlyahOneShotGps;\n  @Nullable private JunctionInfo[] mNavShlyahRoute;\n  private final Handler mHandler;",
     1)
 hs=hs.replace(
     """    if (mSavedLocation != null)
     {
       if (!LocationUtils.isLocationBetterThanLast(location, mSavedLocation))""",
-    """    if (!mNavShlyahOneShotGps && mSavedLocation != null)
+    """    if (!(mLocationProvider instanceof DeadReckoningProvider) &&
+        !mNavShlyahOneShotGps && mSavedLocation != null)
     {
       if (!LocationUtils.isLocationBetterThanLast(location, mSavedLocation))""",
     1)
@@ -75,6 +76,18 @@ gps_method=r'''
     subscribeToGnssStatusUpdates();
     mHandler.removeCallbacks(mLocationTimeoutRunnable);
     mHandler.postDelayed(mLocationTimeoutRunnable, LOCATION_UPDATE_TIMEOUT_MS);
+  }
+
+  /**
+   * Supplies the active offline route to the local dead-reckoning provider.
+   * The provider snaps to this polyline and advances along it instead of
+   * free-running by compass heading.
+   */
+  public void setDeadReckoningRoute(@Nullable JunctionInfo[] points)
+  {
+    mNavShlyahRoute = points;
+    if (mLocationProvider instanceof DeadReckoningProvider)
+      ((DeadReckoningProvider) mLocationProvider).setRoute(points);
   }
 
 '''
@@ -101,6 +114,7 @@ new="""    mSavedLocation = location;
       mLocationProvider.stop();
       unsubscribeFromGnssStatusUpdates();
       mLocationProvider = new DeadReckoningProvider(mContext, this, seed);
+      ((DeadReckoningProvider) mLocationProvider).setRoute(mNavShlyahRoute);
       mInterval = 1000;
       mLocationProvider.start(mInterval);
     }
