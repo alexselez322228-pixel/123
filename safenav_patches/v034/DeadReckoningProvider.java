@@ -10,25 +10,26 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.RequiresPermission;
+import app.organicmaps.sdk.routing.JunctionInfo;
 
 /**
- * Local-only dead reckoning used by NavShlyah UA after the one-shot GNSS fix.
+ * Local-only dead reckoning used by NavShlyah UA after a one-shot GNSS fix.
  *
- * It emits one estimated position every second. For a vehicle it integrates
- * forward linear acceleration in the earth frame and preserves the last
- * estimated velocity between acceleration events. The Organic Maps routing
- * core then map-matches these fixes to the active route.
- *
- * This is intentionally not presented as GNSS-equivalent odometry: phone IMU
- * bias accumulates. The user can request another one-shot GNSS correction.
+ * The provider emits one position every second. When an offline route is known,
+ * all estimated movement is constrained to that route polyline. Vehicle speed
+ * is propagated between acceleration/braking events, because an accelerometer
+ * cannot directly observe constant velocity.
  */
 final class DeadReckoningProvider extends BaseLocationProvider implements SensorEventListener
 {
   private static final double EARTH_RADIUS_M = 6378137.0;
   private static final float STEP_METERS = 0.75f;
   private static final float MAX_SPEED_MPS = 55.0f; // ~198 km/h.
-  private static final float ACCEL_DEADBAND = 0.10f;
+  private static final float START_ADVANCE_SPEED_MPS = 0.25f;
+  private static final float POS_ACCEL_THRESHOLD = 0.30f;
+  private static final float NEG_ACCEL_THRESHOLD = -0.50f;
 
   @NonNull private final SensorManager mSensorManager;
   @NonNull private final Handler mHandler = new Handler(Looper.getMainLooper());
@@ -44,11 +45,15 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private boolean mHaveRotation;
   private boolean mHaveGravity;
 
-  private double mHeadingRad;
+  private double mPhoneHeadingRad;
+  private double mTravelHeadingRad;
   private float mSpeedMps;
   private long mLastTickNanos;
   private long mLastAccelNanos;
   private boolean mRunning;
+
+  @Nullable private JunctionInfo[] mRoute;
+  private int mRouteIndex;
 
   DeadReckoningProvider(@NonNull Context context, @NonNull Listener listener, @NonNull Location seed)
   {
@@ -56,7 +61,42 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
     mLocation = new Location(seed);
     mSpeedMps = seed.hasSpeed() ? Math.max(0.0f, Math.min(MAX_SPEED_MPS, seed.getSpeed())) : 0.0f;
-    mHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
+    mPhoneHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
+    mTravelHeadingRad = mPhoneHeadingRad;
+  }
+
+  /**
+   * Supplies the already-built offline route. The current estimated location is
+   * snapped to the nearest route sample, then all subsequent distance is moved
+   * forward along the route rather than free-running by compass heading.
+   */
+  void setRoute(@Nullable JunctionInfo[] route)
+  {
+    if (route == null || route.length < 2)
+    {
+      mRoute = null;
+      mRouteIndex = 0;
+      return;
+    }
+
+    mRoute = route;
+    int nearest = 0;
+    double best = Double.MAX_VALUE;
+    for (int i = 0; i < route.length; ++i)
+    {
+      double d = distanceMeters(mLocation.getLatitude(), mLocation.getLongitude(), route[i].mLat, route[i].mLon);
+      if (d < best)
+      {
+        best = d;
+        nearest = i;
+      }
+    }
+
+    mRouteIndex = Math.min(nearest, route.length - 2);
+    JunctionInfo p = route[nearest];
+    mLocation.setLatitude(p.mLat);
+    mLocation.setLongitude(p.mLon);
+    updateRouteBearing();
   }
 
   @Override
@@ -113,13 +153,13 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       final double dt = Math.max(0.0, Math.min(2.0, (now - mLastTickNanos) / 1.0e9));
       mLastTickNanos = now;
 
-      // Vehicle mode. Keep velocity across constant-speed intervals; a phone
-      // accelerometer cannot directly observe constant linear velocity.
-      if (mSpeedMps >= 1.2f && dt > 0.0)
+      // Do NOT zero the speed just because current acceleration is ~0:
+      // constant-speed motion has ~0 longitudinal acceleration too.
+      if (mSpeedMps >= START_ADVANCE_SPEED_MPS && dt > 0.0)
         advance(mSpeedMps * dt);
 
-      // Always emit once a second so the routing core, marker and camera update
-      // with the same cadence even during a short stop.
+      // Always emit every second. This keeps route following/camera updates alive
+      // even if the estimated speed is temporarily zero.
       emit(now);
       mHandler.postDelayed(this, 1000);
     }
@@ -137,7 +177,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       SensorManager.getRotationMatrixFromVector(mRotationMatrix, event.values);
       float[] orientation = new float[3];
       SensorManager.getOrientation(mRotationMatrix, orientation);
-      mHeadingRad = orientation[0];
+      mPhoneHeadingRad = orientation[0];
+      if (mRoute == null)
+        mTravelHeadingRad = mPhoneHeadingRad;
       mHaveRotation = true;
       return;
     }
@@ -150,7 +192,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     if (type == Sensor.TYPE_ACCELEROMETER)
     {
-      final float alpha = 0.92f;
+      final float alpha = 0.94f;
       if (!mHaveGravity)
       {
         mGravity[0] = event.values[0];
@@ -169,7 +211,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       return;
     }
 
-    if (type == Sensor.TYPE_STEP_DETECTOR && mSpeedMps < 1.2f)
+    if (type == Sensor.TYPE_STEP_DETECTOR && mSpeedMps < 1.0f)
     {
       advance(STEP_METERS);
       emit(SystemClock.elapsedRealtimeNanos());
@@ -184,7 +226,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       return;
     }
 
-    final double dt = Math.max(0.0, Math.min(0.25, (timestamp - mLastAccelNanos) / 1.0e9));
+    final double dt = Math.max(0.0, Math.min(0.20, (timestamp - mLastAccelNanos) / 1.0e9));
     mLastAccelNanos = timestamp;
     if (dt <= 0.0)
       return;
@@ -192,27 +234,30 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     float forward;
     if (mHaveRotation)
     {
-      // Transform device acceleration into an approximate east/north/up frame.
+      // Approximate device -> earth transform. X=East, Y=North for our projection.
       final float east  = mRotationMatrix[0] * ax + mRotationMatrix[1] * ay + mRotationMatrix[2] * az;
       final float north = mRotationMatrix[3] * ax + mRotationMatrix[4] * ay + mRotationMatrix[5] * az;
-      forward = (float)(east * Math.sin(mHeadingRad) + north * Math.cos(mHeadingRad));
+
+      // When a route is active, project acceleration onto the route tangent
+      // instead of the phone's physical orientation. The phone can be mounted
+      // sideways while the car still follows the road.
+      final double heading = mRoute != null ? mTravelHeadingRad : mPhoneHeadingRad;
+      forward = (float)(east * Math.sin(heading) + north * Math.cos(heading));
     }
     else
     {
-      // Without orientation only use horizontal magnitude as a conservative
-      // indication that motion has started.
-      forward = (float)Math.sqrt(ax * ax + ay * ay);
-      if (mSpeedMps > 0.5f)
-        forward = 0.0f;
+      final float horizontal = (float)Math.sqrt(ax * ax + ay * ay);
+      forward = (horizontal >= POS_ACCEL_THRESHOLD && mSpeedMps < 1.0f) ? horizontal : 0.0f;
     }
 
-    if (Math.abs(forward) < ACCEL_DEADBAND)
-      forward = 0.0f;
-
-    // Reject individual bumps and integrate only plausible vehicle acceleration.
-    forward = Math.max(-4.5f, Math.min(4.5f, forward));
-    mSpeedMps += forward * (float)dt;
-    mSpeedMps = Math.max(0.0f, Math.min(MAX_SPEED_MPS, mSpeedMps));
+    // Ignore the small sensor bias that previously bled the speed to zero after
+    // only a few metres. Only clear acceleration/braking changes speed.
+    if (forward > POS_ACCEL_THRESHOLD || forward < NEG_ACCEL_THRESHOLD)
+    {
+      forward = Math.max(-4.5f, Math.min(4.5f, forward));
+      mSpeedMps += forward * (float)dt;
+      mSpeedMps = Math.max(0.0f, Math.min(MAX_SPEED_MPS, mSpeedMps));
+    }
 
     mLocation.setSpeed(mSpeedMps);
   }
@@ -225,22 +270,100 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     if (meters <= 0.0)
       return;
 
+    if (mRoute != null && mRoute.length >= 2)
+    {
+      advanceAlongRoute(meters);
+      return;
+    }
+
     double lat = Math.toRadians(mLocation.getLatitude());
     double lon = Math.toRadians(mLocation.getLongitude());
     double d = meters / EARTH_RADIUS_M;
 
-    lat += d * Math.cos(mHeadingRad);
+    lat += d * Math.cos(mTravelHeadingRad);
     double cosLat = Math.max(0.01, Math.cos(lat));
-    lon += d * Math.sin(mHeadingRad) / cosLat;
+    lon += d * Math.sin(mTravelHeadingRad) / cosLat;
 
     mLocation.setLatitude(Math.toDegrees(lat));
     mLocation.setLongitude(Math.toDegrees(lon));
-    mLocation.setBearing((float)((Math.toDegrees(mHeadingRad) + 360.0) % 360.0));
-    mLocation.setSpeed(mSpeedMps);
+    mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+  }
 
-    // Make growing IMU uncertainty explicit to the route matcher.
-    float accuracy = mLocation.hasAccuracy() ? mLocation.getAccuracy() : 20.0f;
-    mLocation.setAccuracy(Math.min(500.0f, accuracy + 0.8f));
+  private void advanceAlongRoute(double meters)
+  {
+    double remaining = meters;
+    while (remaining > 0.0 && mRoute != null && mRouteIndex < mRoute.length - 1)
+    {
+      JunctionInfo next = mRoute[mRouteIndex + 1];
+      double hereLat = mLocation.getLatitude();
+      double hereLon = mLocation.getLongitude();
+      double segmentRemaining = distanceMeters(hereLat, hereLon, next.mLat, next.mLon);
+
+      if (segmentRemaining < 0.05)
+      {
+        mRouteIndex++;
+        if (mRouteIndex < mRoute.length - 1)
+          updateRouteBearing();
+        continue;
+      }
+
+      if (remaining < segmentRemaining)
+      {
+        double t = remaining / segmentRemaining;
+        double lat = hereLat + (next.mLat - hereLat) * t;
+        double lon = hereLon + (next.mLon - hereLon) * t;
+        mTravelHeadingRad = bearingRad(hereLat, hereLon, next.mLat, next.mLon);
+        mLocation.setLatitude(lat);
+        mLocation.setLongitude(lon);
+        mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+        remaining = 0.0;
+      }
+      else
+      {
+        mLocation.setLatitude(next.mLat);
+        mLocation.setLongitude(next.mLon);
+        remaining -= segmentRemaining;
+        mRouteIndex++;
+        if (mRouteIndex < mRoute.length - 1)
+          updateRouteBearing();
+      }
+    }
+  }
+
+  private void updateRouteBearing()
+  {
+    if (mRoute == null || mRouteIndex >= mRoute.length - 1)
+      return;
+    JunctionInfo a = mRoute[mRouteIndex];
+    JunctionInfo b = mRoute[mRouteIndex + 1];
+    mTravelHeadingRad = bearingRad(a.mLat, a.mLon, b.mLat, b.mLon);
+    mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+  }
+
+  private static double distanceMeters(double lat1, double lon1, double lat2, double lon2)
+  {
+    double p1 = Math.toRadians(lat1);
+    double p2 = Math.toRadians(lat2);
+    double dp = Math.toRadians(lat2 - lat1);
+    double dl = Math.toRadians(lon2 - lon1);
+    double a = Math.sin(dp / 2.0) * Math.sin(dp / 2.0) +
+               Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2.0) * Math.sin(dl / 2.0);
+    return 2.0 * EARTH_RADIUS_M * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0.0, 1.0 - a)));
+  }
+
+  private static double bearingRad(double lat1, double lon1, double lat2, double lon2)
+  {
+    double p1 = Math.toRadians(lat1);
+    double p2 = Math.toRadians(lat2);
+    double dl = Math.toRadians(lon2 - lon1);
+    double y = Math.sin(dl) * Math.cos(p2);
+    double x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return Math.atan2(y, x);
+  }
+
+  private static float degreesBearing(double rad)
+  {
+    return (float)((Math.toDegrees(rad) + 360.0) % 360.0);
   }
 
   private void emit(long elapsedNanos)
@@ -248,8 +371,14 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mLocation.setProvider("navshlyah_inertial");
     mLocation.setTime(System.currentTimeMillis());
     mLocation.setElapsedRealtimeNanos(elapsedNanos);
-    mLocation.setBearing((float)((Math.toDegrees(mHeadingRad) + 360.0) % 360.0));
+    mLocation.setBearing(degreesBearing(mTravelHeadingRad));
     mLocation.setSpeed(mSpeedMps);
+
+    // Uncertainty grows, but stays bounded so the routing core can keep
+    // map-matching the deliberately route-constrained estimate.
+    float accuracy = mLocation.hasAccuracy() ? mLocation.getAccuracy() : 15.0f;
+    mLocation.setAccuracy(Math.min(80.0f, accuracy + 0.35f));
+
     mListener.onLocationChanged(new Location(mLocation));
   }
 }
