@@ -15,29 +15,41 @@ import androidx.annotation.RequiresPermission;
 import app.organicmaps.sdk.routing.JunctionInfo;
 
 /**
- * Local-only dead reckoning used by NavShlyah UA after a one-shot GNSS fix.
+ * NavShlyah UA local-only vehicle dead reckoning.
  *
- * The provider emits one position every second. When an offline route is known,
- * all estimated movement is constrained to that route polyline. Vehicle speed
- * is propagated between acceleration/braking events, because an accelerometer
- * cannot directly observe constant velocity.
+ * IMPORTANT: phone IMU cannot measure absolute vehicle speed at constant velocity.
+ * This provider therefore combines:
+ *  - last GNSS seed speed;
+ *  - route-longitudinal acceleration integration;
+ *  - rolling motion/stillness classification;
+ *  - zero-velocity update after braking + sustained stillness;
+ *  - gyroscope-based turn tracking;
+ *  - route-constrained map matching.
+ *
+ * It is deliberately best-effort, not GNSS-equivalent odometry.
  */
 final class DeadReckoningProvider extends BaseLocationProvider implements SensorEventListener
 {
   private static final double EARTH_RADIUS_M = 6378137.0;
   private static final float STEP_METERS = 0.75f;
-  private static final float MAX_SPEED_MPS = 55.0f; // ~198 km/h.
-  private static final float START_ADVANCE_SPEED_MPS = 0.25f;
-  private static final float POS_ACCEL_THRESHOLD = 0.18f;
-  private static final float NEG_ACCEL_THRESHOLD = -0.12f;
-  private static final float RESTART_ACCEL_THRESHOLD = 0.32f;
-  private static final float STILL_ACCEL_THRESHOLD = 0.13f;
-  private static final float STOP_SPEED_THRESHOLD_MPS = 1.8f;
-  private static final double STOP_STILL_SECONDS = 1.6;
-  private static final double BRAKE_MEMORY_SECONDS = 5.0;
-  private static final float BRAKE_IMPULSE_FOR_STOP = 0.75f;
-  private static final double OFF_ROUTE_DISTANCE_M = 24.0;
-  private static final double OFF_ROUTE_HEADING_DEG = 42.0;
+  private static final float MAX_SPEED_MPS = 55.0f;
+
+  // Motion classifier. Values are for TYPE_LINEAR_ACCELERATION magnitude.
+  private static final float START_MOTION_EMA = 0.085f;
+  private static final float MOVING_MOTION_EMA = 0.055f;
+  private static final float QUIET_MOTION_EMA = 0.032f;
+  private static final float QUIET_YAW_RAD_S = 0.022f;
+
+  // Speed / stop logic.
+  private static final float MIN_MOVING_SPEED_MPS = 0.9f;
+  private static final float BRAKE_FORWARD_MPS2 = -0.16f;
+  private static final float ACCEL_DEADBAND_MPS2 = 0.055f;
+  private static final double STOP_QUIET_SECONDS = 2.2;
+  private static final double BRAKE_MEMORY_SECONDS = 7.0;
+
+  // Off-route detection.
+  private static final double OFF_ROUTE_DISTANCE_M = 28.0;
+  private static final double OFF_ROUTE_HEADING_DEG = 48.0;
   private static final int OFF_ROUTE_CONFIRM_TICKS = 3;
 
   @NonNull private final SensorManager mSensorManager;
@@ -45,6 +57,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   @NonNull private final Location mLocation;
 
   private Sensor mRotation;
+  private Sensor mGyro;
   private Sensor mLinearAcceleration;
   private Sensor mAccelerometer;
   private Sensor mStep;
@@ -56,25 +69,30 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
   private double mPhoneHeadingRad;
   private double mTravelHeadingRad;
+  private double mShadowHeadingRad;
+  private float mYawRateRadS;
+
   private float mSpeedMps;
+  private float mForwardAccelEma;
+  private float mMotionEma;
+
   private long mLastTickNanos;
   private long mLastAccelNanos;
-  private long mStillSinceNanos;
+  private long mLastGyroNanos;
+  private long mQuietSinceNanos;
   private long mLastBrakeNanos;
-  private float mBrakeImpulse;
-  private float mFilteredForward;
+  private long mMoveEvidenceSinceNanos;
+
   private boolean mStationary;
   private boolean mRunning;
+  private boolean mHadBrake;
 
   @Nullable private JunctionInfo[] mRoute;
   private int mRouteIndex;
 
-  // Shadow solution is deliberately NOT snapped to the active route. It is used
-  // only to decide whether the vehicle actually left the planned road.
+  // Free-running shadow solution used only to detect a real route deviation.
   private double mShadowLat;
   private double mShadowLon;
-  private double mHeadingOffsetRad;
-  private boolean mHeadingCalibrated;
   private boolean mOffRoute;
   private int mOffRouteTicks;
 
@@ -83,18 +101,15 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     super(listener);
     mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
     mLocation = new Location(seed);
-    mSpeedMps = seed.hasSpeed() ? Math.max(0.0f, Math.min(MAX_SPEED_MPS, seed.getSpeed())) : 0.0f;
+    mSpeedMps = seed.hasSpeed() ? clamp(seed.getSpeed(), 0.0f, MAX_SPEED_MPS) : 0.0f;
     mPhoneHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
     mTravelHeadingRad = mPhoneHeadingRad;
+    mShadowHeadingRad = mTravelHeadingRad;
     mShadowLat = seed.getLatitude();
     mShadowLon = seed.getLongitude();
+    mStationary = mSpeedMps < 0.35f;
   }
 
-  /**
-   * Supplies the already-built offline route. The current estimated location is
-   * snapped to the nearest route sample, then all subsequent distance is moved
-   * forward along the route rather than free-running by compass heading.
-   */
   void setRoute(@Nullable JunctionInfo[] route)
   {
     if (route == null || route.length < 2)
@@ -103,15 +118,13 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       mRouteIndex = 0;
       mOffRoute = false;
       mOffRouteTicks = 0;
-      mHeadingCalibrated = false;
       return;
     }
 
     mRoute = route;
     mOffRoute = false;
     mOffRouteTicks = 0;
-    mShadowLat = mLocation.getLatitude();
-    mShadowLon = mLocation.getLongitude();
+
     int nearest = 0;
     double best = Double.MAX_VALUE;
     for (int i = 0; i < route.length; ++i)
@@ -131,13 +144,12 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mShadowLat = p.mLat;
     mShadowLon = p.mLon;
     updateRouteBearing();
-    if (mHaveRotation)
-    {
-      mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
-      mHeadingCalibrated = true;
-    }
-    else
-      mHeadingCalibrated = false;
+    mShadowHeadingRad = mTravelHeadingRad;
+  }
+
+  boolean isOffRoute()
+  {
+    return mOffRoute;
   }
 
   @Override
@@ -148,9 +160,12 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       return;
 
     mRunning = true;
+
     mRotation = mSensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
     if (mRotation == null)
       mRotation = mSensorManager.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR);
+
+    mGyro = mSensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
 
     mLinearAcceleration = mSensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION);
     if (mLinearAcceleration == null)
@@ -160,6 +175,8 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     if (mRotation != null)
       mSensorManager.registerListener(this, mRotation, SensorManager.SENSOR_DELAY_GAME);
+    if (mGyro != null)
+      mSensorManager.registerListener(this, mGyro, SensorManager.SENSOR_DELAY_GAME);
     if (mLinearAcceleration != null)
       mSensorManager.registerListener(this, mLinearAcceleration, SensorManager.SENSOR_DELAY_GAME);
     else if (mAccelerometer != null)
@@ -167,13 +184,12 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     if (mStep != null)
       mSensorManager.registerListener(this, mStep, SensorManager.SENSOR_DELAY_NORMAL);
 
-    mLastTickNanos = SystemClock.elapsedRealtimeNanos();
+    final long now = SystemClock.elapsedRealtimeNanos();
+    mLastTickNanos = now;
     mLastAccelNanos = 0L;
-    mStillSinceNanos = 0L;
-    mLastBrakeNanos = 0L;
-    mBrakeImpulse = 0.0f;
-    mFilteredForward = 0.0f;
-    mStationary = mSpeedMps < START_ADVANCE_SPEED_MPS;
+    mLastGyroNanos = 0L;
+    mQuietSinceNanos = 0L;
+    mMoveEvidenceSinceNanos = 0L;
     mHandler.post(mTicker);
   }
 
@@ -199,14 +215,14 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       final double dt = Math.max(0.0, Math.min(2.0, (now - mLastTickNanos) / 1.0e9));
       mLastTickNanos = now;
 
-      // Constant-speed motion has near-zero acceleration, so preserve velocity
-      // while MOVING. Once the stop detector confirms a real stop, freeze route
-      // progress until a fresh launch acceleration is observed.
-      if (!mStationary && mSpeedMps >= START_ADVANCE_SPEED_MPS && dt > 0.0)
+      // If sensors clearly say "moving" but integration drifted speed close to
+      // zero, keep a conservative crawl speed so route progress does not freeze.
+      if (!mStationary && mMotionEma >= MOVING_MOTION_EMA && mSpeedMps < MIN_MOVING_SPEED_MPS)
+        mSpeedMps = MIN_MOVING_SPEED_MPS;
+
+      if (!mStationary && mSpeedMps >= 0.20f && dt > 0.0)
         advance(mSpeedMps * dt);
 
-      // Always emit every second. This keeps route following/camera updates alive
-      // even if the estimated speed is temporarily zero.
       emit(now);
       mHandler.postDelayed(this, 1000);
     }
@@ -219,6 +235,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       return;
 
     final int type = event.sensor.getType();
+
     if (type == Sensor.TYPE_ROTATION_VECTOR || type == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
     {
       SensorManager.getRotationMatrixFromVector(mRotationMatrix, event.values);
@@ -226,13 +243,21 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       SensorManager.getOrientation(mRotationMatrix, orientation);
       mPhoneHeadingRad = orientation[0];
       mHaveRotation = true;
+
+      // When no route is available use absolute fused heading. During routing
+      // the gyroscope carries short-term turn changes and the route constrains
+      // the displayed position.
       if (mRoute == null)
-        mTravelHeadingRad = mPhoneHeadingRad;
-      else if (!mHeadingCalibrated && !mOffRoute)
       {
-        mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
-        mHeadingCalibrated = true;
+        mTravelHeadingRad = mPhoneHeadingRad;
+        mShadowHeadingRad = mPhoneHeadingRad;
       }
+      return;
+    }
+
+    if (type == Sensor.TYPE_GYROSCOPE)
+    {
+      integrateGyro(event);
       return;
     }
 
@@ -253,9 +278,11 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
         mHaveGravity = true;
         return;
       }
+
       mGravity[0] = alpha * mGravity[0] + (1.0f - alpha) * event.values[0];
       mGravity[1] = alpha * mGravity[1] + (1.0f - alpha) * event.values[1];
       mGravity[2] = alpha * mGravity[2] + (1.0f - alpha) * event.values[2];
+
       integrateAcceleration(event.values[0] - mGravity[0],
                             event.values[1] - mGravity[1],
                             event.values[2] - mGravity[2],
@@ -265,9 +292,47 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     if (type == Sensor.TYPE_STEP_DETECTOR && mSpeedMps < 1.0f)
     {
+      mStationary = false;
       advance(STEP_METERS);
       emit(SystemClock.elapsedRealtimeNanos());
     }
+  }
+
+  private void integrateGyro(@NonNull SensorEvent event)
+  {
+    final long now = event.timestamp;
+    if (mLastGyroNanos == 0L)
+    {
+      mLastGyroNanos = now;
+      return;
+    }
+
+    final double dt = Math.max(0.0, Math.min(0.10, (now - mLastGyroNanos) / 1.0e9));
+    mLastGyroNanos = now;
+    if (dt <= 0.0)
+      return;
+
+    float verticalRate;
+    if (mHaveRotation)
+    {
+      // Transform device angular velocity into earth coordinates. World Z is
+      // approximately vertical, making turn detection independent of how the
+      // phone is mounted in the cabin.
+      verticalRate = mRotationMatrix[6] * event.values[0] +
+                     mRotationMatrix[7] * event.values[1] +
+                     mRotationMatrix[8] * event.values[2];
+    }
+    else
+    {
+      verticalRate = event.values[2];
+    }
+
+    mYawRateRadS = 0.88f * mYawRateRadS + 0.12f * verticalRate;
+
+    // Android gyro positive vertical rotation is opposite navigation bearing
+    // sign in our north/east convention.
+    if (Math.abs(mYawRateRadS) > 0.008f)
+      mShadowHeadingRad = normalizeRad(mShadowHeadingRad - mYawRateRadS * dt);
   }
 
   private void integrateAcceleration(float ax, float ay, float az, long timestamp)
@@ -283,110 +348,96 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     if (dt <= 0.0)
       return;
 
-    float forward;
+    final float magnitude = (float)Math.sqrt(ax * ax + ay * ay + az * az);
+    mMotionEma = 0.94f * mMotionEma + 0.06f * magnitude;
+
+    float forward = 0.0f;
     if (mHaveRotation)
     {
-      // Approximate device -> earth transform. X=East, Y=North for our projection.
       final float east  = mRotationMatrix[0] * ax + mRotationMatrix[1] * ay + mRotationMatrix[2] * az;
       final float north = mRotationMatrix[3] * ax + mRotationMatrix[4] * ay + mRotationMatrix[5] * az;
-
-      // When a route is active, project acceleration onto the route tangent
-      // instead of the phone's physical orientation. The phone can be mounted
-      // sideways while the car still follows the road.
-      final double heading = mRoute != null ? mTravelHeadingRad : mPhoneHeadingRad;
+      final double heading = mRoute != null ? mTravelHeadingRad : mShadowHeadingRad;
       forward = (float)(east * Math.sin(heading) + north * Math.cos(heading));
     }
-    else
-    {
-      final float horizontal = (float)Math.sqrt(ax * ax + ay * ay);
-      forward = (horizontal >= POS_ACCEL_THRESHOLD && mSpeedMps < 1.0f) ? horizontal : 0.0f;
-    }
 
-    // Low-pass the route-longitudinal acceleration. This rejects short bumps
-    // while still retaining the longer deceleration pulse when the vehicle stops.
-    mFilteredForward = 0.82f * mFilteredForward + 0.18f * forward;
-    final float horizontal = (float)Math.sqrt(ax * ax + ay * ay + az * az);
-    final long now = timestamp;
+    mForwardAccelEma = 0.90f * mForwardAccelEma + 0.10f * forward;
 
-    if (mFilteredForward < NEG_ACCEL_THRESHOLD)
-    {
-      final float decel = Math.max(-4.5f, mFilteredForward);
-      mSpeedMps += decel * (float)dt;
-      mSpeedMps = Math.max(0.0f, mSpeedMps);
-      mBrakeImpulse += (-decel) * (float)dt;
-      mLastBrakeNanos = now;
-      mStationary = false;
-    }
-    else if (mFilteredForward > POS_ACCEL_THRESHOLD)
-    {
-      final float accel = Math.min(4.5f, mFilteredForward);
-      mSpeedMps += accel * (float)dt;
-      mSpeedMps = Math.min(MAX_SPEED_MPS, mSpeedMps);
-
-      // Any clear acceleration after braking means the car kept moving or
-      // started again, so cancel a pending stop classification.
-      if (accel > RESTART_ACCEL_THRESHOLD)
-      {
-        mStationary = false;
-        mStillSinceNanos = 0L;
-        mBrakeImpulse = 0.0f;
-      }
-    }
-
-    // Zero-velocity update. A quiet accelerometer alone cannot distinguish a
-    // stopped car from perfectly constant-speed travel, so we only declare a
-    // stop after BOTH: recent braking evidence and a sustained quiet period.
-    if (horizontal <= STILL_ACCEL_THRESHOLD)
-    {
-      if (mStillSinceNanos == 0L)
-        mStillSinceNanos = now;
-
-      final double stillFor = (now - mStillSinceNanos) / 1.0e9;
-      final double brakeAge = mLastBrakeNanos == 0L ? Double.MAX_VALUE : (now - mLastBrakeNanos) / 1.0e9;
-      final boolean brakingEndedInStop =
-          mBrakeImpulse >= BRAKE_IMPULSE_FOR_STOP && brakeAge <= BRAKE_MEMORY_SECONDS;
-
-      if (stillFor >= STOP_STILL_SECONDS &&
-          (mSpeedMps <= STOP_SPEED_THRESHOLD_MPS || brakingEndedInStop))
-      {
-        mSpeedMps = 0.0f;
-        mStationary = true;
-        mBrakeImpulse = 0.0f;
-        mFilteredForward = 0.0f;
-      }
-    }
-    else
-    {
-      mStillSinceNanos = 0L;
-    }
-
-    // While stopped, ignore tiny vibration from the engine/road. A distinct
-    // positive launch acceleration releases the zero-velocity lock.
+    // Start detection is based on total motion energy, not on the signed
+    // projection. This fixes the previous "СТОЇМО while driving" bug when the
+    // phone was mounted at an arbitrary angle.
     if (mStationary)
     {
-      mSpeedMps = 0.0f;
-      if (mFilteredForward > RESTART_ACCEL_THRESHOLD)
+      if (mMotionEma >= START_MOTION_EMA || Math.abs(mYawRateRadS) > 0.07f)
       {
-        mStationary = false;
-        mSpeedMps = Math.max(0.45f, mSpeedMps);
+        if (mMoveEvidenceSinceNanos == 0L)
+          mMoveEvidenceSinceNanos = timestamp;
+
+        if ((timestamp - mMoveEvidenceSinceNanos) / 1.0e9 >= 0.35)
+        {
+          mStationary = false;
+          mHadBrake = false;
+          mQuietSinceNanos = 0L;
+          mSpeedMps = Math.max(MIN_MOVING_SPEED_MPS, mSpeedMps);
+        }
       }
+      else
+      {
+        mMoveEvidenceSinceNanos = 0L;
+      }
+    }
+
+    // Signed acceleration still improves the approximate speed, but it is no
+    // longer the only mechanism deciding whether the vehicle is moving.
+    if (!mStationary && Math.abs(mForwardAccelEma) >= ACCEL_DEADBAND_MPS2)
+    {
+      final float a = clamp(mForwardAccelEma, -4.5f, 4.5f);
+      mSpeedMps = clamp(mSpeedMps + a * (float)dt, 0.0f, MAX_SPEED_MPS);
+
+      if (a <= BRAKE_FORWARD_MPS2)
+      {
+        mHadBrake = true;
+        mLastBrakeNanos = timestamp;
+      }
+    }
+
+    final boolean quiet =
+        mMotionEma <= QUIET_MOTION_EMA &&
+        Math.abs(mYawRateRadS) <= QUIET_YAW_RAD_S &&
+        Math.abs(mForwardAccelEma) <= 0.06f;
+
+    if (!mStationary && quiet)
+    {
+      if (mQuietSinceNanos == 0L)
+        mQuietSinceNanos = timestamp;
+
+      final double quietFor = (timestamp - mQuietSinceNanos) / 1.0e9;
+      final double brakeAge = mLastBrakeNanos == 0L
+          ? Double.MAX_VALUE : (timestamp - mLastBrakeNanos) / 1.0e9;
+
+      // Do not classify smooth constant-speed driving as a stop. We need either
+      // recent braking or an already very low estimated speed.
+      if (quietFor >= STOP_QUIET_SECONDS &&
+          ((mHadBrake && brakeAge <= BRAKE_MEMORY_SECONDS) || mSpeedMps < 0.65f))
+      {
+        mStationary = true;
+        mSpeedMps = 0.0f;
+        mHadBrake = false;
+        mMoveEvidenceSinceNanos = 0L;
+      }
+    }
+    else
+    {
+      mQuietSinceNanos = 0L;
     }
 
     mLocation.setSpeed(mSpeedMps);
   }
-
-  @Override
-  public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
   private void advance(double meters)
   {
     if (meters <= 0.0)
       return;
 
-    // Always maintain a free-running shadow position. While it remains close
-    // to the route, the displayed position stays snapped to the route. If the
-    // shadow solution consistently leaves the route, switch to it and let the
-    // app rebuild the route from the estimated off-route position.
     advanceShadow(meters);
 
     if (mRoute != null && mRoute.length >= 2 && !mOffRoute)
@@ -399,28 +450,23 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     mLocation.setLatitude(mShadowLat);
     mLocation.setLongitude(mShadowLon);
-    mTravelHeadingRad = shadowHeadingRad();
+    mTravelHeadingRad = mShadowHeadingRad;
     mLocation.setBearing(degreesBearing(mTravelHeadingRad));
   }
 
   private void advanceShadow(double meters)
   {
-    final double heading = shadowHeadingRad();
+    final double heading = mShadowHeadingRad;
     double lat = Math.toRadians(mShadowLat);
     double lon = Math.toRadians(mShadowLon);
     final double d = meters / EARTH_RADIUS_M;
+
     lat += d * Math.cos(heading);
     final double cosLat = Math.max(0.01, Math.cos(lat));
     lon += d * Math.sin(heading) / cosLat;
+
     mShadowLat = Math.toDegrees(lat);
     mShadowLon = Math.toDegrees(lon);
-  }
-
-  private double shadowHeadingRad()
-  {
-    if (!mHaveRotation)
-      return mTravelHeadingRad;
-    return normalizeRad(mPhoneHeadingRad + (mHeadingCalibrated ? mHeadingOffsetRad : 0.0));
   }
 
   private void evaluateRouteDeviation()
@@ -428,18 +474,18 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     if (mRoute == null || mRoute.length < 2)
       return;
 
-    // The route points are sampled every ~3 m. Search a local window around
-    // progress to keep this O(1) for long routes.
     final int from = Math.max(0, mRouteIndex - 20);
     final int to = Math.min(mRoute.length - 1, mRouteIndex + 100);
+
     double best = Double.MAX_VALUE;
     for (int i = from; i <= to; ++i)
       best = Math.min(best, distanceMeters(mShadowLat, mShadowLon, mRoute[i].mLat, mRoute[i].mLon));
 
     final double headingDiff = Math.abs(Math.toDegrees(
-        normalizeRad(shadowHeadingRad() - mTravelHeadingRad)));
+        normalizeRad(mShadowHeadingRad - mTravelHeadingRad)));
 
-    final boolean suspicious = best > OFF_ROUTE_DISTANCE_M ||
+    final boolean suspicious =
+        best > OFF_ROUTE_DISTANCE_M ||
         (mSpeedMps > 2.0f && headingDiff > OFF_ROUTE_HEADING_DEG);
 
     if (suspicious)
@@ -452,19 +498,15 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       mOffRoute = true;
       mLocation.setLatitude(mShadowLat);
       mLocation.setLongitude(mShadowLon);
-      mTravelHeadingRad = shadowHeadingRad();
+      mTravelHeadingRad = mShadowHeadingRad;
       mLocation.setBearing(degreesBearing(mTravelHeadingRad));
     }
-  }
-
-  boolean isOffRoute()
-  {
-    return mOffRoute;
   }
 
   private void advanceAlongRoute(double meters)
   {
     double remaining = meters;
+
     while (remaining > 0.0 && mRoute != null && mRouteIndex < mRoute.length - 1)
     {
       JunctionInfo next = mRoute[mRouteIndex + 1];
@@ -483,11 +525,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       if (remaining < segmentRemaining)
       {
         double t = remaining / segmentRemaining;
-        double lat = hereLat + (next.mLat - hereLat) * t;
-        double lon = hereLon + (next.mLon - hereLon) * t;
         mTravelHeadingRad = bearingRad(hereLat, hereLon, next.mLat, next.mLon);
-        mLocation.setLatitude(lat);
-        mLocation.setLongitude(lon);
+        mLocation.setLatitude(hereLat + (next.mLat - hereLat) * t);
+        mLocation.setLongitude(hereLon + (next.mLon - hereLon) * t);
         mLocation.setBearing(degreesBearing(mTravelHeadingRad));
         remaining = 0.0;
       }
@@ -507,6 +547,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   {
     if (mRoute == null || mRouteIndex >= mRoute.length - 1)
       return;
+
     JunctionInfo a = mRoute[mRouteIndex];
     JunctionInfo b = mRoute[mRouteIndex + 1];
     mTravelHeadingRad = bearingRad(a.mLat, a.mLon, b.mLat, b.mLon);
@@ -519,9 +560,13 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     double p2 = Math.toRadians(lat2);
     double dp = Math.toRadians(lat2 - lat1);
     double dl = Math.toRadians(lon2 - lon1);
+
     double a = Math.sin(dp / 2.0) * Math.sin(dp / 2.0) +
-               Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2.0) * Math.sin(dl / 2.0);
-    return 2.0 * EARTH_RADIUS_M * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0.0, 1.0 - a)));
+               Math.cos(p1) * Math.cos(p2) *
+               Math.sin(dl / 2.0) * Math.sin(dl / 2.0);
+
+    return 2.0 * EARTH_RADIUS_M *
+           Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0.0, 1.0 - a)));
   }
 
   private static double bearingRad(double lat1, double lon1, double lat2, double lon2)
@@ -529,8 +574,11 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     double p1 = Math.toRadians(lat1);
     double p2 = Math.toRadians(lat2);
     double dl = Math.toRadians(lon2 - lon1);
+
     double y = Math.sin(dl) * Math.cos(p2);
-    double x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    double x = Math.cos(p1) * Math.sin(p2) -
+               Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+
     return Math.atan2(y, x);
   }
 
@@ -546,18 +594,21 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     return (float)((Math.toDegrees(rad) + 360.0) % 360.0);
   }
 
+  private static float clamp(float value, float min, float max)
+  {
+    return Math.max(min, Math.min(max, value));
+  }
+
   private void emit(long elapsedNanos)
   {
     mLocation.setProvider("navshlyah_inertial");
     mLocation.setTime(System.currentTimeMillis());
     mLocation.setElapsedRealtimeNanos(elapsedNanos);
     mLocation.setBearing(degreesBearing(mTravelHeadingRad));
-    mLocation.setSpeed(mSpeedMps);
+    mLocation.setSpeed(mStationary ? 0.0f : mSpeedMps);
 
-    // Uncertainty grows, but stays bounded so the routing core can keep
-    // map-matching the deliberately route-constrained estimate.
     float accuracy = mLocation.hasAccuracy() ? mLocation.getAccuracy() : 15.0f;
-    mLocation.setAccuracy(Math.min(80.0f, accuracy + 0.35f));
+    mLocation.setAccuracy(Math.min(80.0f, accuracy + 0.30f));
 
     mListener.onLocationChanged(new Location(mLocation));
   }
