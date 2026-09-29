@@ -90,6 +90,12 @@ gps_method=r'''
       ((DeadReckoningProvider) mLocationProvider).setRoute(points);
   }
 
+  public boolean isDeadReckoningOffRoute()
+  {
+    return mLocationProvider instanceof DeadReckoningProvider &&
+           ((DeadReckoningProvider) mLocationProvider).isOffRoute();
+  }
+
 '''
 anchor="  /**\n   * Restart the location with a new refresh interval if changed.\n   */"
 if anchor not in hs:
