@@ -298,6 +298,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     }
   }
 
+  @Override
+  public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
   private void integrateGyro(@NonNull SensorEvent event)
   {
     final long now = event.timestamp;
