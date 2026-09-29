@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.location.Location;
 import android.os.*;
 import android.speech.tts.TextToSpeech;
 import android.view.Gravity;
@@ -20,6 +21,7 @@ import app.organicmaps.sdk.widget.placepage.PlacePageData;
 import app.organicmaps.sdk.Router;
 import app.organicmaps.sdk.bookmarks.data.MapObject;
 import app.organicmaps.sdk.routing.CarDirection;
+import app.organicmaps.sdk.routing.JunctionInfo;
 import app.organicmaps.sdk.routing.RoutingController;
 import app.organicmaps.sdk.routing.RoutingInfo;
 
@@ -191,6 +193,10 @@ public final class MainActivity extends Activity implements RoutingController.Co
 
   private void startNavigation(){
     if(!routing.isBuilt()) return;
+    try {
+      JunctionInfo[] routePoints=Framework.nativeGetRouteJunctionPoints(3.0);
+      om.getLocationHelper().setDeadReckoningRoute(routePoints);
+    } catch(Throwable ignored) {}
     routing.start();
     lastAnnouncedBucket=-1;
     lastDirection=CarDirection.NoTurn;
@@ -202,6 +208,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
 
   private void stopNavigation(){
     routing.cancel();
+    om.getLocationHelper().setDeadReckoningRoute(null);
     stopButton.setEnabled(false);
     startButton.setEnabled(false);
     navMain.setText("Навігацію завершено");
@@ -222,8 +229,12 @@ public final class MainActivity extends Activity implements RoutingController.Co
     String dir=directionText(info.carDirection,info.exitNum);
     String street=(info.nextStreet==null||info.nextStreet.isEmpty()) ? "" : " • "+info.nextStreet;
     navMain.setText((dist.isEmpty()?"":dist+" • ")+dir);
+    Location estimated=om.getLocationHelper().getSavedLocation();
+    String speed="";
+    if(estimated!=null && "navshlyah_inertial".equals(estimated.getProvider()))
+      speed=String.format(Locale.forLanguageTag("uk")," • ~%.0f км/год",estimated.getSpeed()*3.6f);
     navSub.setText("До фінішу: "+info.distToTarget.toString(this)+" • "+formatTime(info.totalTimeInSeconds)+street+
-                   String.format(Locale.forLanguageTag("uk")," • %.0f%%",info.completionPercent));
+                   String.format(Locale.forLanguageTag("uk")," • %.0f%%",info.completionPercent)+speed);
 
     announceIfNeeded(info);
   }
@@ -312,9 +323,16 @@ public final class MainActivity extends Activity implements RoutingController.Co
     else status.setText("Без дозволу на GPS автоматичну початкову точку визначити неможливо.");
   }
 
-  @Override public void onStartRouteBuilding(){ status.setText("Маршрут обчислюється офлайн…"); }
+  @Override public void onStartRouteBuilding(){
+    om.getLocationHelper().setDeadReckoningRoute(null);
+    status.setText("Маршрут обчислюється офлайн…");
+  }
   @Override public void updateBuildProgress(int progress, Router router){ navMain.setText("Побудова маршруту: "+progress+"%"); }
   @Override public void onBuiltRoute(){
+    try {
+      JunctionInfo[] routePoints=Framework.nativeGetRouteJunctionPoints(3.0);
+      om.getLocationHelper().setDeadReckoningRoute(routePoints);
+    } catch(Throwable ignored) {}
     navMain.setText("Маршрут готовий");
     navSub.setText("Натисніть СТАРТ для щосекундного ведення.");
     startButton.setEnabled(true);
