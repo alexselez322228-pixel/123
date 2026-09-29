@@ -36,6 +36,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private static final double STOP_STILL_SECONDS = 1.6;
   private static final double BRAKE_MEMORY_SECONDS = 5.0;
   private static final float BRAKE_IMPULSE_FOR_STOP = 0.75f;
+  private static final double OFF_ROUTE_DISTANCE_M = 24.0;
+  private static final double OFF_ROUTE_HEADING_DEG = 42.0;
+  private static final int OFF_ROUTE_CONFIRM_TICKS = 3;
 
   @NonNull private final SensorManager mSensorManager;
   @NonNull private final Handler mHandler = new Handler(Looper.getMainLooper());
@@ -66,6 +69,15 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   @Nullable private JunctionInfo[] mRoute;
   private int mRouteIndex;
 
+  // Shadow solution is deliberately NOT snapped to the active route. It is used
+  // only to decide whether the vehicle actually left the planned road.
+  private double mShadowLat;
+  private double mShadowLon;
+  private double mHeadingOffsetRad;
+  private boolean mHeadingCalibrated;
+  private boolean mOffRoute;
+  private int mOffRouteTicks;
+
   DeadReckoningProvider(@NonNull Context context, @NonNull Listener listener, @NonNull Location seed)
   {
     super(listener);
@@ -74,6 +86,8 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mSpeedMps = seed.hasSpeed() ? Math.max(0.0f, Math.min(MAX_SPEED_MPS, seed.getSpeed())) : 0.0f;
     mPhoneHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
     mTravelHeadingRad = mPhoneHeadingRad;
+    mShadowLat = seed.getLatitude();
+    mShadowLon = seed.getLongitude();
   }
 
   /**
@@ -87,10 +101,17 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     {
       mRoute = null;
       mRouteIndex = 0;
+      mOffRoute = false;
+      mOffRouteTicks = 0;
+      mHeadingCalibrated = false;
       return;
     }
 
     mRoute = route;
+    mOffRoute = false;
+    mOffRouteTicks = 0;
+    mShadowLat = mLocation.getLatitude();
+    mShadowLon = mLocation.getLongitude();
     int nearest = 0;
     double best = Double.MAX_VALUE;
     for (int i = 0; i < route.length; ++i)
@@ -107,7 +128,16 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     JunctionInfo p = route[nearest];
     mLocation.setLatitude(p.mLat);
     mLocation.setLongitude(p.mLon);
+    mShadowLat = p.mLat;
+    mShadowLon = p.mLon;
     updateRouteBearing();
+    if (mHaveRotation)
+    {
+      mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
+      mHeadingCalibrated = true;
+    }
+    else
+      mHeadingCalibrated = false;
   }
 
   @Override
@@ -195,9 +225,14 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       float[] orientation = new float[3];
       SensorManager.getOrientation(mRotationMatrix, orientation);
       mPhoneHeadingRad = orientation[0];
+      mHaveRotation = true;
       if (mRoute == null)
         mTravelHeadingRad = mPhoneHeadingRad;
-      mHaveRotation = true;
+      else if (!mHeadingCalibrated && !mOffRoute)
+      {
+        mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
+        mHeadingCalibrated = true;
+      }
       return;
     }
 
@@ -348,23 +383,83 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     if (meters <= 0.0)
       return;
 
-    if (mRoute != null && mRoute.length >= 2)
+    // Always maintain a free-running shadow position. While it remains close
+    // to the route, the displayed position stays snapped to the route. If the
+    // shadow solution consistently leaves the route, switch to it and let the
+    // app rebuild the route from the estimated off-route position.
+    advanceShadow(meters);
+
+    if (mRoute != null && mRoute.length >= 2 && !mOffRoute)
     {
       advanceAlongRoute(meters);
-      return;
+      evaluateRouteDeviation();
+      if (!mOffRoute)
+        return;
     }
 
-    double lat = Math.toRadians(mLocation.getLatitude());
-    double lon = Math.toRadians(mLocation.getLongitude());
-    double d = meters / EARTH_RADIUS_M;
-
-    lat += d * Math.cos(mTravelHeadingRad);
-    double cosLat = Math.max(0.01, Math.cos(lat));
-    lon += d * Math.sin(mTravelHeadingRad) / cosLat;
-
-    mLocation.setLatitude(Math.toDegrees(lat));
-    mLocation.setLongitude(Math.toDegrees(lon));
+    mLocation.setLatitude(mShadowLat);
+    mLocation.setLongitude(mShadowLon);
+    mTravelHeadingRad = shadowHeadingRad();
     mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+  }
+
+  private void advanceShadow(double meters)
+  {
+    final double heading = shadowHeadingRad();
+    double lat = Math.toRadians(mShadowLat);
+    double lon = Math.toRadians(mShadowLon);
+    final double d = meters / EARTH_RADIUS_M;
+    lat += d * Math.cos(heading);
+    final double cosLat = Math.max(0.01, Math.cos(lat));
+    lon += d * Math.sin(heading) / cosLat;
+    mShadowLat = Math.toDegrees(lat);
+    mShadowLon = Math.toDegrees(lon);
+  }
+
+  private double shadowHeadingRad()
+  {
+    if (!mHaveRotation)
+      return mTravelHeadingRad;
+    return normalizeRad(mPhoneHeadingRad + (mHeadingCalibrated ? mHeadingOffsetRad : 0.0));
+  }
+
+  private void evaluateRouteDeviation()
+  {
+    if (mRoute == null || mRoute.length < 2)
+      return;
+
+    // The route points are sampled every ~3 m. Search a local window around
+    // progress to keep this O(1) for long routes.
+    final int from = Math.max(0, mRouteIndex - 20);
+    final int to = Math.min(mRoute.length - 1, mRouteIndex + 100);
+    double best = Double.MAX_VALUE;
+    for (int i = from; i <= to; ++i)
+      best = Math.min(best, distanceMeters(mShadowLat, mShadowLon, mRoute[i].mLat, mRoute[i].mLon));
+
+    final double headingDiff = Math.abs(Math.toDegrees(
+        normalizeRad(shadowHeadingRad() - mTravelHeadingRad)));
+
+    final boolean suspicious = best > OFF_ROUTE_DISTANCE_M ||
+        (mSpeedMps > 2.0f && headingDiff > OFF_ROUTE_HEADING_DEG);
+
+    if (suspicious)
+      mOffRouteTicks++;
+    else
+      mOffRouteTicks = Math.max(0, mOffRouteTicks - 1);
+
+    if (mOffRouteTicks >= OFF_ROUTE_CONFIRM_TICKS)
+    {
+      mOffRoute = true;
+      mLocation.setLatitude(mShadowLat);
+      mLocation.setLongitude(mShadowLon);
+      mTravelHeadingRad = shadowHeadingRad();
+      mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+    }
+  }
+
+  boolean isOffRoute()
+  {
+    return mOffRoute;
   }
 
   private void advanceAlongRoute(double meters)
@@ -437,6 +532,13 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     double y = Math.sin(dl) * Math.cos(p2);
     double x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
     return Math.atan2(y, x);
+  }
+
+  private static double normalizeRad(double rad)
+  {
+    while (rad > Math.PI) rad -= 2.0 * Math.PI;
+    while (rad < -Math.PI) rad += 2.0 * Math.PI;
+    return rad;
   }
 
   private static float degreesBearing(double rad)
