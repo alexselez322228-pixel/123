@@ -28,8 +28,14 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private static final float STEP_METERS = 0.75f;
   private static final float MAX_SPEED_MPS = 55.0f; // ~198 km/h.
   private static final float START_ADVANCE_SPEED_MPS = 0.25f;
-  private static final float POS_ACCEL_THRESHOLD = 0.30f;
-  private static final float NEG_ACCEL_THRESHOLD = -0.50f;
+  private static final float POS_ACCEL_THRESHOLD = 0.18f;
+  private static final float NEG_ACCEL_THRESHOLD = -0.12f;
+  private static final float RESTART_ACCEL_THRESHOLD = 0.32f;
+  private static final float STILL_ACCEL_THRESHOLD = 0.13f;
+  private static final float STOP_SPEED_THRESHOLD_MPS = 1.8f;
+  private static final double STOP_STILL_SECONDS = 1.6;
+  private static final double BRAKE_MEMORY_SECONDS = 5.0;
+  private static final float BRAKE_IMPULSE_FOR_STOP = 0.75f;
 
   @NonNull private final SensorManager mSensorManager;
   @NonNull private final Handler mHandler = new Handler(Looper.getMainLooper());
@@ -50,6 +56,11 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private float mSpeedMps;
   private long mLastTickNanos;
   private long mLastAccelNanos;
+  private long mStillSinceNanos;
+  private long mLastBrakeNanos;
+  private float mBrakeImpulse;
+  private float mFilteredForward;
+  private boolean mStationary;
   private boolean mRunning;
 
   @Nullable private JunctionInfo[] mRoute;
@@ -128,6 +139,11 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     mLastTickNanos = SystemClock.elapsedRealtimeNanos();
     mLastAccelNanos = 0L;
+    mStillSinceNanos = 0L;
+    mLastBrakeNanos = 0L;
+    mBrakeImpulse = 0.0f;
+    mFilteredForward = 0.0f;
+    mStationary = mSpeedMps < START_ADVANCE_SPEED_MPS;
     mHandler.post(mTicker);
   }
 
@@ -153,9 +169,10 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       final double dt = Math.max(0.0, Math.min(2.0, (now - mLastTickNanos) / 1.0e9));
       mLastTickNanos = now;
 
-      // Do NOT zero the speed just because current acceleration is ~0:
-      // constant-speed motion has ~0 longitudinal acceleration too.
-      if (mSpeedMps >= START_ADVANCE_SPEED_MPS && dt > 0.0)
+      // Constant-speed motion has near-zero acceleration, so preserve velocity
+      // while MOVING. Once the stop detector confirms a real stop, freeze route
+      // progress until a fresh launch acceleration is observed.
+      if (!mStationary && mSpeedMps >= START_ADVANCE_SPEED_MPS && dt > 0.0)
         advance(mSpeedMps * dt);
 
       // Always emit every second. This keeps route following/camera updates alive
@@ -250,13 +267,74 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       forward = (horizontal >= POS_ACCEL_THRESHOLD && mSpeedMps < 1.0f) ? horizontal : 0.0f;
     }
 
-    // Ignore the small sensor bias that previously bled the speed to zero after
-    // only a few metres. Only clear acceleration/braking changes speed.
-    if (forward > POS_ACCEL_THRESHOLD || forward < NEG_ACCEL_THRESHOLD)
+    // Low-pass the route-longitudinal acceleration. This rejects short bumps
+    // while still retaining the longer deceleration pulse when the vehicle stops.
+    mFilteredForward = 0.82f * mFilteredForward + 0.18f * forward;
+    final float horizontal = (float)Math.sqrt(ax * ax + ay * ay + az * az);
+    final long now = timestamp;
+
+    if (mFilteredForward < NEG_ACCEL_THRESHOLD)
     {
-      forward = Math.max(-4.5f, Math.min(4.5f, forward));
-      mSpeedMps += forward * (float)dt;
-      mSpeedMps = Math.max(0.0f, Math.min(MAX_SPEED_MPS, mSpeedMps));
+      final float decel = Math.max(-4.5f, mFilteredForward);
+      mSpeedMps += decel * (float)dt;
+      mSpeedMps = Math.max(0.0f, mSpeedMps);
+      mBrakeImpulse += (-decel) * (float)dt;
+      mLastBrakeNanos = now;
+      mStationary = false;
+    }
+    else if (mFilteredForward > POS_ACCEL_THRESHOLD)
+    {
+      final float accel = Math.min(4.5f, mFilteredForward);
+      mSpeedMps += accel * (float)dt;
+      mSpeedMps = Math.min(MAX_SPEED_MPS, mSpeedMps);
+
+      // Any clear acceleration after braking means the car kept moving or
+      // started again, so cancel a pending stop classification.
+      if (accel > RESTART_ACCEL_THRESHOLD)
+      {
+        mStationary = false;
+        mStillSinceNanos = 0L;
+        mBrakeImpulse = 0.0f;
+      }
+    }
+
+    // Zero-velocity update. A quiet accelerometer alone cannot distinguish a
+    // stopped car from perfectly constant-speed travel, so we only declare a
+    // stop after BOTH: recent braking evidence and a sustained quiet period.
+    if (horizontal <= STILL_ACCEL_THRESHOLD)
+    {
+      if (mStillSinceNanos == 0L)
+        mStillSinceNanos = now;
+
+      final double stillFor = (now - mStillSinceNanos) / 1.0e9;
+      final double brakeAge = mLastBrakeNanos == 0L ? Double.MAX_VALUE : (now - mLastBrakeNanos) / 1.0e9;
+      final boolean brakingEndedInStop =
+          mBrakeImpulse >= BRAKE_IMPULSE_FOR_STOP && brakeAge <= BRAKE_MEMORY_SECONDS;
+
+      if (stillFor >= STOP_STILL_SECONDS &&
+          (mSpeedMps <= STOP_SPEED_THRESHOLD_MPS || brakingEndedInStop))
+      {
+        mSpeedMps = 0.0f;
+        mStationary = true;
+        mBrakeImpulse = 0.0f;
+        mFilteredForward = 0.0f;
+      }
+    }
+    else
+    {
+      mStillSinceNanos = 0L;
+    }
+
+    // While stopped, ignore tiny vibration from the engine/road. A distinct
+    // positive launch acceleration releases the zero-velocity lock.
+    if (mStationary)
+    {
+      mSpeedMps = 0.0f;
+      if (mFilteredForward > RESTART_ACCEL_THRESHOLD)
+      {
+        mStationary = false;
+        mSpeedMps = Math.max(0.45f, mSpeedMps);
+      }
     }
 
     mLocation.setSpeed(mSpeedMps);
