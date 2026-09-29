@@ -21,7 +21,7 @@ import app.organicmaps.sdk.routing.JunctionInfo;
  * This provider therefore combines:
  *  - last GNSS seed speed;
  *  - route-longitudinal acceleration integration;
- *  - rolling motion/stillness classification;
+ *  - conservative launch/stillness classification that rejects casual phone movement;
  *  - zero-velocity update after braking + sustained stillness;
  *  - gyroscope-based turn tracking;
  *  - route-constrained map matching.
@@ -35,16 +35,22 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private static final float MAX_SPEED_MPS = 55.0f;
 
   // Motion classifier. Values are for TYPE_LINEAR_ACCELERATION magnitude.
-  private static final float START_MOTION_EMA = 0.085f;
-  private static final float MOVING_MOTION_EMA = 0.055f;
   private static final float QUIET_MOTION_EMA = 0.032f;
   private static final float QUIET_YAW_RAD_S = 0.022f;
 
+  // Conservative launch detector. Do not interpret casual phone/body movement
+  // as vehicle motion. A real launch must accumulate a sustained linear-
+  // acceleration impulse before the stationary lock is released.
+  private static final float LAUNCH_ACCEL_THRESHOLD = 0.16f;
+  private static final float LAUNCH_PEAK_THRESHOLD = 0.34f;
+  private static final float LAUNCH_IMPULSE_THRESHOLD = 0.42f; // m/s equivalent.
+  private static final double LAUNCH_WINDOW_SECONDS = 1.6;
+  private static final float INITIAL_ROLL_SPEED_MPS = 0.22f;
+
   // Speed / stop logic.
-  private static final float MIN_MOVING_SPEED_MPS = 0.9f;
-  private static final float BRAKE_FORWARD_MPS2 = -0.16f;
-  private static final float ACCEL_DEADBAND_MPS2 = 0.055f;
-  private static final double STOP_QUIET_SECONDS = 2.2;
+  private static final float BRAKE_FORWARD_MPS2 = -0.14f;
+  private static final float ACCEL_DEADBAND_MPS2 = 0.050f;
+  private static final double STOP_QUIET_SECONDS = 2.4;
   private static final double BRAKE_MEMORY_SECONDS = 7.0;
 
   // Off-route detection.
@@ -82,6 +88,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private long mQuietSinceNanos;
   private long mLastBrakeNanos;
   private long mMoveEvidenceSinceNanos;
+  private long mLaunchWindowStartNanos;
+  private float mLaunchImpulse;
+  private float mLaunchPeak;
 
   private boolean mStationary;
   private boolean mRunning;
@@ -190,6 +199,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mLastGyroNanos = 0L;
     mQuietSinceNanos = 0L;
     mMoveEvidenceSinceNanos = 0L;
+    mLaunchWindowStartNanos = 0L;
+    mLaunchImpulse = 0.0f;
+    mLaunchPeak = 0.0f;
     mHandler.post(mTicker);
   }
 
@@ -215,11 +227,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       final double dt = Math.max(0.0, Math.min(2.0, (now - mLastTickNanos) / 1.0e9));
       mLastTickNanos = now;
 
-      // If sensors clearly say "moving" but integration drifted speed close to
-      // zero, keep a conservative crawl speed so route progress does not freeze.
-      if (!mStationary && mMotionEma >= MOVING_MOTION_EMA && mSpeedMps < MIN_MOVING_SPEED_MPS)
-        mSpeedMps = MIN_MOVING_SPEED_MPS;
-
+      // Never fabricate a minimum vehicle speed. In v1.8 that fallback was
+      // exactly why a stationary phone could display ~3 km/h and crawl along
+      // the route. Only an actually integrated non-zero speed advances position.
       if (!mStationary && mSpeedMps >= 0.20f && dt > 0.0)
         advance(mSpeedMps * dt);
 
@@ -290,7 +300,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       return;
     }
 
-    if (type == Sensor.TYPE_STEP_DETECTOR && mSpeedMps < 1.0f)
+    if (type == Sensor.TYPE_STEP_DETECTOR && mRoute == null && mSpeedMps < 1.0f)
     {
       mStationary = false;
       advance(STEP_METERS);
@@ -365,27 +375,36 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     mForwardAccelEma = 0.90f * mForwardAccelEma + 0.10f * forward;
 
-    // Start detection is based on total motion energy, not on the signed
-    // projection. This fixes the previous "СТОЇМО while driving" bug when the
-    // phone was mounted at an arbitrary angle.
+    // Conservative vehicle-start detector. Gyroscope rotation must NOT start
+    // the car by itself (turning the phone while sitting still is common).
+    // We require a real sustained linear-acceleration impulse within a short
+    // window. This intentionally prefers a missed very-gentle launch over a
+    // false "3 km/h" crawl while the phone is stationary.
     if (mStationary)
     {
-      if (mMotionEma >= START_MOTION_EMA || Math.abs(mYawRateRadS) > 0.07f)
+      if (mLaunchWindowStartNanos == 0L ||
+          (timestamp - mLaunchWindowStartNanos) / 1.0e9 > LAUNCH_WINDOW_SECONDS)
       {
-        if (mMoveEvidenceSinceNanos == 0L)
-          mMoveEvidenceSinceNanos = timestamp;
-
-        if ((timestamp - mMoveEvidenceSinceNanos) / 1.0e9 >= 0.35)
-        {
-          mStationary = false;
-          mHadBrake = false;
-          mQuietSinceNanos = 0L;
-          mSpeedMps = Math.max(MIN_MOVING_SPEED_MPS, mSpeedMps);
-        }
+        mLaunchWindowStartNanos = timestamp;
+        mLaunchImpulse = 0.0f;
+        mLaunchPeak = 0.0f;
       }
-      else
+
+      final float excess = Math.max(0.0f, magnitude - LAUNCH_ACCEL_THRESHOLD);
+      mLaunchImpulse += excess * (float)dt;
+      mLaunchPeak = Math.max(mLaunchPeak, magnitude);
+
+      if (mLaunchImpulse >= LAUNCH_IMPULSE_THRESHOLD &&
+          mLaunchPeak >= LAUNCH_PEAK_THRESHOLD)
       {
-        mMoveEvidenceSinceNanos = 0L;
+        mStationary = false;
+        mHadBrake = false;
+        mQuietSinceNanos = 0L;
+        mMoveEvidenceSinceNanos = timestamp;
+        mSpeedMps = Math.max(INITIAL_ROLL_SPEED_MPS, mSpeedMps);
+        mLaunchWindowStartNanos = 0L;
+        mLaunchImpulse = 0.0f;
+        mLaunchPeak = 0.0f;
       }
     }
 
@@ -426,6 +445,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
         mSpeedMps = 0.0f;
         mHadBrake = false;
         mMoveEvidenceSinceNanos = 0L;
+        mLaunchWindowStartNanos = 0L;
+        mLaunchImpulse = 0.0f;
+        mLaunchPeak = 0.0f;
       }
     }
     else
