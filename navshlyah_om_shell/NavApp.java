@@ -7,7 +7,7 @@ public final class NavApp extends Application {
   private OrganicMaps maps;
   @Override public void onCreate() {
     super.onCreate();
-    maps = new OrganicMaps(getApplicationContext(), "fdroid", getPackageName(), 19, "1.9.0");
+    maps = new OrganicMaps(getApplicationContext(), "fdroid", getPackageName(), 20, "2.0.0");
     try {
       maps.init(() -> {});
     } catch (Exception e) {
