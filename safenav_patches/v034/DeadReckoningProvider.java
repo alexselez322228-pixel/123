@@ -46,6 +46,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private static final float LAUNCH_IMPULSE_THRESHOLD = 0.42f; // m/s equivalent.
   private static final double LAUNCH_WINDOW_SECONDS = 1.6;
   private static final float INITIAL_ROLL_SPEED_MPS = 0.22f;
+  private static final float TRUST_GNSS_SEED_SPEED_MPS = 2.5f; // ignore ~0-9 km/h stationary GNSS drift
 
   // Speed / stop logic.
   private static final float BRAKE_FORWARD_MPS2 = -0.14f;
@@ -76,6 +77,8 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
   private double mPhoneHeadingRad;
   private double mTravelHeadingRad;
   private double mShadowHeadingRad;
+  private double mHeadingOffsetRad;
+  private boolean mHeadingCalibrated;
   private float mYawRateRadS;
 
   private float mSpeedMps;
@@ -110,13 +113,28 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     super(listener);
     mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
     mLocation = new Location(seed);
-    mSpeedMps = seed.hasSpeed() ? clamp(seed.getSpeed(), 0.0f, MAX_SPEED_MPS) : 0.0f;
+    final float seedSpeed = seed.hasSpeed() ? clamp(seed.getSpeed(), 0.0f, MAX_SPEED_MPS) : 0.0f;
+
+    // GNSS commonly reports ~1-5 km/h while a stationary phone is drifting.
+    // Do not inherit that as vehicle motion. Only a clearly moving seed is
+    // trusted; otherwise start from a hard zero and require IMU launch evidence.
+    if (seedSpeed >= TRUST_GNSS_SEED_SPEED_MPS)
+    {
+      mSpeedMps = seedSpeed;
+      mStationary = false;
+    }
+    else
+    {
+      mSpeedMps = 0.0f;
+      mStationary = true;
+      mLocation.setSpeed(0.0f);
+    }
+
     mPhoneHeadingRad = Math.toRadians(seed.hasBearing() ? seed.getBearing() : 0.0f);
     mTravelHeadingRad = mPhoneHeadingRad;
     mShadowHeadingRad = mTravelHeadingRad;
     mShadowLat = seed.getLatitude();
     mShadowLon = seed.getLongitude();
-    mStationary = mSpeedMps < 0.35f;
   }
 
   void setRoute(@Nullable JunctionInfo[] route)
@@ -127,6 +145,7 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       mRouteIndex = 0;
       mOffRoute = false;
       mOffRouteTicks = 0;
+      mHeadingCalibrated = false;
       return;
     }
 
@@ -154,6 +173,13 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mShadowLon = p.mLon;
     updateRouteBearing();
     mShadowHeadingRad = mTravelHeadingRad;
+    if (mHaveRotation)
+    {
+      mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
+      mHeadingCalibrated = true;
+    }
+    else
+      mHeadingCalibrated = false;
   }
 
   boolean isOffRoute()
@@ -254,13 +280,22 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
       mPhoneHeadingRad = orientation[0];
       mHaveRotation = true;
 
-      // When no route is available use absolute fused heading. During routing
-      // the gyroscope carries short-term turn changes and the route constrains
-      // the displayed position.
       if (mRoute == null)
       {
         mTravelHeadingRad = mPhoneHeadingRad;
         mShadowHeadingRad = mPhoneHeadingRad;
+      }
+      else
+      {
+        // Calibrate the phone's arbitrary mounting angle to the route once,
+        // then keep an absolute heading estimate from the rotation vector.
+        // This makes visible rotation work even while the vehicle is stopped.
+        if (!mHeadingCalibrated)
+        {
+          mHeadingOffsetRad = normalizeRad(mTravelHeadingRad - mPhoneHeadingRad);
+          mHeadingCalibrated = true;
+        }
+        mShadowHeadingRad = normalizeRad(mPhoneHeadingRad + mHeadingOffsetRad);
       }
       return;
     }
@@ -342,9 +377,9 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
 
     mYawRateRadS = 0.88f * mYawRateRadS + 0.12f * verticalRate;
 
-    // Android gyro positive vertical rotation is opposite navigation bearing
-    // sign in our north/east convention.
-    if (Math.abs(mYawRateRadS) > 0.008f)
+    // If no fused rotation vector exists, integrate gyro heading ourselves.
+    // Otherwise the rotation vector continuously corrects absolute heading.
+    if (!mHaveRotation && Math.abs(mYawRateRadS) > 0.008f)
       mShadowHeadingRad = normalizeRad(mShadowHeadingRad - mYawRateRadS * dt);
   }
 
@@ -629,7 +664,8 @@ final class DeadReckoningProvider extends BaseLocationProvider implements Sensor
     mLocation.setProvider("navshlyah_inertial");
     mLocation.setTime(System.currentTimeMillis());
     mLocation.setElapsedRealtimeNanos(elapsedNanos);
-    mLocation.setBearing(degreesBearing(mTravelHeadingRad));
+    final double displayHeading = (mStationary || mOffRoute) ? mShadowHeadingRad : mTravelHeadingRad;
+    mLocation.setBearing(degreesBearing(displayHeading));
     mLocation.setSpeed(mStationary ? 0.0f : mSpeedMps);
 
     float accuracy = mLocation.hasAccuracy() ? mLocation.getAccuracy() : 15.0f;
