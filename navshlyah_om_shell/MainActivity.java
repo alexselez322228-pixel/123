@@ -20,6 +20,7 @@ import app.organicmaps.sdk.PlacePageActivationListener;
 import app.organicmaps.sdk.widget.placepage.PlacePageData;
 import app.organicmaps.sdk.Router;
 import app.organicmaps.sdk.bookmarks.data.MapObject;
+import app.organicmaps.sdk.location.LocationState;
 import app.organicmaps.sdk.routing.CarDirection;
 import app.organicmaps.sdk.routing.JunctionInfo;
 import app.organicmaps.sdk.routing.RoutingController;
@@ -201,12 +202,23 @@ public final class MainActivity extends Activity implements RoutingController.Co
       om.getLocationHelper().setDeadReckoningRoute(routePoints);
     } catch(Throwable ignored) {}
     routing.start();
+    handler.postDelayed(this::ensureFollowAndRotate,350);
     lastAnnouncedBucket=-1;
     lastDirection=CarDirection.NoTurn;
     startButton.setEnabled(false);
     stopButton.setEnabled(true);
     status.setText("Навігація активна. Камера слідкує за рухом щосекунди; GNSS вимкнений до ручного уточнення.");
     speak("Навігацію розпочато");
+  }
+
+  private void ensureFollowAndRotate(){
+    try{
+      for(int i=0;i<5;i++){
+        int mode=LocationState.getMode();
+        if(mode==LocationState.FOLLOW_AND_ROTATE) return;
+        LocationState.nativeSwitchToNextMode();
+      }
+    }catch(Throwable ignored){}
   }
 
   private void stopNavigation(){
@@ -231,8 +243,12 @@ public final class MainActivity extends Activity implements RoutingController.Co
     }
 
     if(!routing.isNavigating()) return;
-    // Keep the camera locked to the locally estimated position and route.
-    try { Framework.nativeFollowRoute(); } catch(Throwable ignored) {}
+    // Keep the camera locked to the locally estimated position and heading.
+    try {
+      Framework.nativeFollowRoute();
+      if(LocationState.getMode()!=LocationState.FOLLOW_AND_ROTATE)
+        ensureFollowAndRotate();
+    } catch(Throwable ignored) {}
     RoutingInfo info;
     try { info=Framework.nativeGetRouteFollowingInfo(); }
     catch(Throwable t){ return; }
@@ -379,6 +395,7 @@ public final class MainActivity extends Activity implements RoutingController.Co
       restartAfterReroute=false;
       autoRerouting=false;
       routing.start();
+      handler.postDelayed(this::ensureFollowAndRotate,350);
       startButton.setEnabled(false);
       stopButton.setEnabled(true);
       navMain.setText("Маршрут перебудовано");
